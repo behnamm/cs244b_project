@@ -23,6 +23,7 @@
 #include "MacAddress.h"
 
 namespace RAMCloud {
+
 /**
  * This class provides a way for the SolarFlareDriver and transport to deduce
  * the address of the destination or source(local address) of a packet.
@@ -30,21 +31,26 @@ namespace RAMCloud {
 class SolarFlareAddress : public Driver::Address {
   public:
     explicit SolarFlareAddress(const ServiceLocator& serviceLocator);
-    explicit SolarFlareAddress(const uint8_t mac[6]
-                               , const uint32_t ip
-                               , const uint16_t port);
+    explicit SolarFlareAddress(const uint8_t mac[6], 
+                               const uint32_t ip,
+                               const uint16_t port);
+
     explicit SolarFlareAddress(const SolarFlareAddress& other)
         : Address()
         , ipAddress(other.ipAddress)
         , macAddress(other.macAddress)
     {}
+
     SolarFlareAddress* clone() const {
         return new SolarFlareAddress(*this);
     }
+
     string toString() const;
-    //a RAMCloud::IpAddress object that hold the layer 3 address
+
+    // A RAMCloud::IpAddress object that hold the layer 3 address
     IpAddress ipAddress;
-    //a RAMCloud::MacAddress object that holds the layer 2 address
+
+    // A RAMCloud::MacAddress object that holds the layer 2 address
     MacAddress macAddress;
 };
 

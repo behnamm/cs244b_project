@@ -37,6 +37,7 @@ using namespace EthernetUtil; //NOLINT
 SolarFlareDriver::SolarFlareDriver(Context* context,
                                    const ServiceLocator* localServiceLocator)
     : context(context)
+    , arpCache(context, this)
     , localStringLocator()
     , localAddress()
     , incomingPacketHandler()
@@ -69,10 +70,15 @@ SolarFlareDriver::SolarFlareDriver(Context* context,
             "Created the locator string: %s"
             , localStringLocator.c_str());
         localAddress.construct(sl);
-
-    } else {
-        localAddress.construct(*localServiceLocator);
+    } else if (!localServiceLocator->getOption<const char*>("mac", NULL)) {
+        std::stringstream macStream;
+        macStream << ",mac=" << getLocalMac("eth0").c_str(); 
         localStringLocator = localServiceLocator->getOriginalString();
+        ServiceLocator sl(localStringLocator + macStream.str());
+        localAddress.construct(sl); 
+    } else {
+        localStringLocator = localServiceLocator->getOriginalString();
+        localAddress.construct(*localServiceLocator);
     }
 
     // Adapter initializations. Fills driverHandle with driver resources
@@ -309,13 +315,11 @@ SolarFlareDriver::sendPacket(const Driver::Address* recipient,
     uint16_t ipLen = downCast<uint16_t>(udpLen + sizeof(IpHeader));
     assert(udpPayloadLen <= getMaxPacketSize());
     struct PacketBuff* toSend = getFreeTransmitBuffer();
-
-    // Fill ethernet header
-    EthernetHeader* ethHdr = new(toSend->dmaBuffer) EthernetHeader;
     const SolarFlareAddress* recipientAddress =
         static_cast<const SolarFlareAddress*>(recipient);
-    memcpy(ethHdr->destAddress, recipientAddress->macAddress.address,
-           sizeof(ethHdr->destAddress));
+
+    // Fill ethernet header except recipient's mac address
+    EthernetHeader* ethHdr = new(toSend->dmaBuffer) EthernetHeader;
     memcpy(ethHdr->srcAddress, localAddress->macAddress.address,
            sizeof(ethHdr->srcAddress));
     ethHdr->etherType = HTONS(EthernetType::IP_V4);
@@ -357,19 +361,61 @@ SolarFlareDriver::sendPacket(const Driver::Address* recipient,
         payload->next();
     }
 
-    // Transmit the buffer
     uint32_t totalLen =  downCast<uint32_t>(sizeof(EthernetHeader) + ipLen);
+    
+    // Resolve recipient mac address
+    const uint8_t *recvMac = recipientAddress->macAddress.address;
+    if (recvMac[5] == 0x00 && recvMac[4] == 0x00 && recvMac[3] == 0x00 &&
+        recvMac[2] == 0x00 && recvMac[1] == 0x00 && recvMac[0] == 0x00) {
+
+        // No mac has been provided, so we need to resolve it through arp
+        // process.
+        if (arpCache.arpLookup(toSend->dmaBuffer, totalLen, "eth0")) {
+
+            // By invoking ef_vi_transmit() the descriptor that describes the
+            // packet is queued in the transmit ring, and a doorbell is rung to
+            // inform the adapter that the transmit ring is non-empty. Later on
+            // in Poller::poll() we fetch notifications off of the event queue
+            // that implies which packet trasnmit is completed.
+            ef_vi_transmit(&virtualInterface, toSend->dmaBufferAddress,
+                downCast<int>(totalLen), toSend->id);
+        } else {
+
+            // Could not resolve mac from the local arp cache or kernel arp
+            // cache so we have to queue the packet to send it later. We just
+            // need to push back the transmit buffer to the transmit pool and
+            // return without sending the packet out.
+            toSend->next = freeTransmitList;
+            freeTransmitList = toSend;
+        }
+    } else {
+        memcpy(ethHdr->destAddress, recvMac,
+           sizeof(ethHdr->destAddress));
+      
     //LOG(NOTICE, "%s", (ethernetHeaderToStr(ethHdr)).c_str());
     //LOG(NOTICE, "%s", (ipHeaderToStr(ipHdr)).c_str());
     //LOG(NOTICE, "%s", (udpHeaderToStr(udpHdr)).c_str());
-
-    // By invoking ef_vi_transmit() the descriptor that describes the
-    // packet is queued in the transmit ring, and a doorbell is rung to
-    // inform the adapter that the transmit ring is non-empty. Later on in
-    // Poller::poll() we fetch notifications off of the event queue that
-    // implies which packet trasnmit is completed.
     ef_vi_transmit(&virtualInterface, toSend->dmaBufferAddress,
                    downCast<int>(totalLen), toSend->id);
+    }
+}
+
+/**
+ * Transmits an already prepared ethernet frame (including header and pyload).
+ *
+ * \param ethPkt
+ *      pionter to the first byte of the header of the ethernet frame.
+ *
+ *  \param pktLen
+ *      total lenght in bytes of the ethernet frame (header and payload).
+ */
+void
+SolarFlareDriver::sendEthPacket(const uint8_t* ethPkt, const uint32_t pktLen)
+{
+    struct PacketBuff* toSend = getFreeTransmitBuffer();
+    memcpy(toSend->dmaBuffer, ethPkt, pktLen);
+    ef_vi_transmit(&virtualInterface, toSend->dmaBufferAddress,
+        downCast<int>(pktLen), toSend->id);
 }
 
 /**

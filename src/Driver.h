@@ -229,6 +229,8 @@ class Driver {
                             uint32_t headerLen,
                             Buffer::Iterator *payload) = 0;
 
+    virtual void sendEthPacket(const uint8_t* ethPkt, const uint32_t pktLen);
+
     /**
      * Return the ServiceLocator for this Driver. If the Driver
      * was not provided static parameters (e.g. fixed TCP or UDP port),

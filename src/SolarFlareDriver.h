@@ -21,6 +21,7 @@
 #include <etherfabric/pd.h>
 #include <etherfabric/vi.h>
 
+#include "ArpCache.h"
 #include "Common.h"
 #include "Dispatch.h"
 #include "Driver.h"
@@ -59,6 +60,7 @@ class SolarFlareDriver : public Driver {
                             const void* header,
                             const uint32_t headerLen,
                             Buffer::Iterator *payload);
+    virtual void sendEthPacket(const uint8_t* ethPkt, const uint32_t pktLen);
     virtual string getServiceLocator();
     virtual Driver::Address* newAddress(const ServiceLocator& serviceLocator) {
         return new SolarFlareAddress(serviceLocator);
@@ -120,6 +122,9 @@ class SolarFlareDriver : public Driver {
   PRIVATE:
     // Shared RAMCloud information.
     Context* context;
+
+    // Used to resolve destination mac address of outgoing packets
+    ArpCache arpCache;
 
     // Keeps a copy of locator string for this SolarFlareDriver.
     string localStringLocator;
