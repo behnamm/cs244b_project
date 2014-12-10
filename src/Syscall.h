@@ -101,6 +101,10 @@ class Syscall {
         return ::fwrite(src, size, count, f);
     }
     VIRTUAL_FOR_TESTING
+    int getsockname(int sockfd, sockaddr* addr, socklen_t* addrlen) {
+        return ::getsockname(sockfd, addr, addrlen);
+    }
+    VIRTUAL_FOR_TESTING
     int listen(int sockfd, int backlog) {
         return ::listen(sockfd, backlog);
     }

@@ -31,14 +31,16 @@ namespace RAMCloud {
 class SolarFlareAddress : public Driver::Address {
   public:
     explicit SolarFlareAddress(const ServiceLocator& serviceLocator);
-    explicit SolarFlareAddress(const uint8_t mac[6],
-                               const uint32_t ip,
-                               const uint16_t port);
+    explicit SolarFlareAddress(const uint32_t ip,
+                               const uint16_t port,
+                               const uint8_t mac[6] = NULL);
+
 
     explicit SolarFlareAddress(const SolarFlareAddress& other)
         : Address()
         , ipAddress(other.ipAddress)
         , macAddress(other.macAddress)
+        , macProvided(other.macProvided)
     {}
 
     SolarFlareAddress* clone() const {
@@ -48,10 +50,13 @@ class SolarFlareAddress : public Driver::Address {
     string toString() const;
 
     // A RAMCloud::IpAddress object that hold the layer 3 address
-    IpAddress ipAddress;
+    Tub<IpAddress> ipAddress;
 
     // A RAMCloud::MacAddress object that holds the layer 2 address
-    MacAddress macAddress;
+    Tub<MacAddress> macAddress;
+
+    // True if MAC address is provided and not equal to 00:00:00:00:00:00
+    bool macProvided;
 };
 
 }// end RAMCloud

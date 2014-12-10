@@ -73,6 +73,7 @@ TESTS_SRCFILES := \
 		  src/MockExternalStorage.cc \
 		  src/MockExternalStorageTest.cc \
 		  src/MockTransport.cc \
+		  src/MultiIncrementTest.cc \
 		  src/MultiOpTest.cc \
 		  src/MultiReadTest.cc \
 		  src/MultiRemoveTest.cc \
@@ -85,6 +86,7 @@ TESTS_SRCFILES := \
 		  src/ObjectTest.cc \
 		  src/OptionParserTest.cc \
 		  src/PerfCounterTest.cc \
+		  src/PerfStatsTest.cc \
 		  src/PingServiceTest.cc \
 		  src/PortAlarm.cc \
 		  src/PortAlarmTest.cc \
@@ -118,6 +120,8 @@ TESTS_SRCFILES := \
 		  src/SessionAlarmTest.cc \
 		  src/SideLogTest.cc \
 		  src/SingleFileStorageTest.cc \
+		  src/SolarFlareDriverTest.cc \
+		  src/SpinLockTest.cc \
 		  src/SpinLockTest.cc \
 		  src/StatusTest.cc \
 		  src/StringUtilTest.cc \
