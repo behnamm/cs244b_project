@@ -35,6 +35,10 @@ enum EthernetType {
     IP_V4 = 0x0800 // Standard ethernet type when the payload is an ip packet.
 };
 
+// Standard size of an ethernet frame including header.
+static const uint32_t ETHERNET_MAX_DATA_LEN = 1500;
+
+
 /**
  * Standard Ethernet Header structure. 
  */

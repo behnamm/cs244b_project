@@ -37,7 +37,7 @@ using namespace EthernetUtil; //NOLINT
 SolarFlareDriver::SolarFlareDriver(Context* context,
                                    const ServiceLocator* localServiceLocator)
     : context(context)
-    , arpCache(context, this)
+    , arpCache()
     , localStringLocator()
     , localAddress()
     , incomingPacketHandler()
@@ -163,6 +163,7 @@ SolarFlareDriver::SolarFlareDriver(Context* context,
     freeTransmitList = initPacketBuffer(transmitMemory,
                                         NUM_TX_BUFS,
                                         &registeredMemory);
+    arpCache.construct(context, this, localIp);
 }
 
 /**
@@ -370,7 +371,7 @@ SolarFlareDriver::sendPacket(const Driver::Address* recipient,
 
         // No mac has been provided, so we need to resolve it through arp
         // process.
-        if (arpCache.arpLookup(toSend->dmaBuffer, totalLen, "eth0")) {
+        if (arpCache->arpLookup(toSend->dmaBuffer, "eth0")) {
 
             // By invoking ef_vi_transmit() the descriptor that describes the
             // packet is queued in the transmit ring, and a doorbell is rung to
@@ -382,11 +383,12 @@ SolarFlareDriver::sendPacket(const Driver::Address* recipient,
         } else {
 
             // Could not resolve mac from the local arp cache or kernel arp
-            // cache so we have to queue the packet to send it later. We just
-            // need to push back the transmit buffer to the transmit pool and
-            // return without sending the packet out.
+            // cache. This probably means we don't have access to kernel arp
+            // cache or kernel arp cache times out pretty quickly.
             toSend->next = freeTransmitList;
             freeTransmitList = toSend;
+            DIE("Can't resolve mac destination address. Either there is no"
+               " no proper access to kernel ARP cache or it times out quick!");
         }
     } else {
         memcpy(ethHdr->destAddress, recvMac,

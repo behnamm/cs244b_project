@@ -81,9 +81,6 @@ class SolarFlareDriver : public Driver {
     // Size of the event queue on the adapter.
     static const uint32_t EF_VI_EVENT_POLL_NUM_EVS = 128;
 
-    // Standard size of an ethernet frame including header.
-    static const uint32_t ETHERNET_MAX_DATA_LEN = 1500;
-
     // Due to performance considerations, we refill RX ring in a batch of
     // size equal to below constant.
     static const uint32_t RX_REFILL_BATCH_SIZE = 32;
@@ -124,7 +121,7 @@ class SolarFlareDriver : public Driver {
     Context* context;
 
     // Used to resolve destination mac address of outgoing packets
-    ArpCache arpCache;
+    Tub<ArpCache> arpCache;
 
     // Keeps a copy of locator string for this SolarFlareDriver.
     string localStringLocator;

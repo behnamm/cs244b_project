@@ -20,8 +20,11 @@
 #include "Dispatch.h"
 #include "Tub.h"
 #include "Driver.h"
+#include "EthernetUtil.h"
 
 namespace RAMCloud {
+
+using namespace EthernetUtil; //NOLINT
 
 /**
  * ArpCache provides local table for IP-MAC translation. Layer 3 driver codes
@@ -31,89 +34,47 @@ namespace RAMCloud {
  */
 class ArpCache {
   public:
-    class ArpPing;
-    explicit ArpCache(Context* context, Driver* driver);
-    
-    bool arpLookup(uint8_t* ethPkt, uint32_t packetLen,
+    explicit ArpCache(Context* context, Driver* driver, uint32_t localIp);
+    bool arpLookup(uint8_t* ethPkt,
                    const char* ifName);
 
     static const int MAX_IFACE_LEN = 16;
     static const int MAC_ADDR_LEN = 6;
-
-    struct QueuedPacket {
-        QueuedPacket()
-            : next(NULL)
-            , packetLen(0)
-            , ethPkt()
-        {}
-
-        struct QueuedPacket* next; 
-        uint32_t packetLen;
-        uint8_t ethPkt[MAC_ADDR_LEN];  
-    };
-
-    class ArpPingSocketHandler : public Dispatch::File {
-      public:
-        ArpPingSocketHandler(int fd, ArpPing* arpPing);
-        virtual void handleFileEvent(int events);
-      PRIVATE:
-        int fd;
-        ArpPing* arpPing;
-        DISALLOW_COPY_AND_ASSIGN(ArpPingSocketHandler);
-    };
-
-    class ArpPing {
-      public:
-        friend class ArpPingSocketHandler;
-        explicit ArpPing(ArpCache* arpCache, uint32_t destIp);
-        ~ArpPing();
-        void sendPing();
-        void handlePong();
-      PRIVATE:
-        ArpCache* arpCache;
-        struct sockaddr address;
-        int fd;
-        int pingPktLen;
-        Tub<ArpPingSocketHandler> arpPingIoHandler;
-        
-        uint16_t cksum(const uint8_t* pkt, int len);
-        DISALLOW_COPY_AND_ASSIGN(ArpPing);
-    };
+    static const int ARP_RETRIES = 10;
+    static const int ARP_WAIT = 50;
 
     struct ArpEntry {
         ArpEntry()
-            : head(NULL)
-            , tail(NULL)
-            , ifName()
+            : ifName()
             , macAddress()
-            , arpPing(NULL)
+            , address()
+            , valid(false)
         {}
 
-        struct QueuedPacket* head; 
-        struct QueuedPacket* tail;
         char ifName[MAX_IFACE_LEN];
         uint8_t macAddress[MAC_ADDR_LEN];
-        ArpPing* arpPing;
+        struct sockaddr address;
+        bool valid;
     };
 
 
   PRIVATE:
-    friend class ArpPing;
     typedef std::unordered_map<uint32_t, ArpEntry> IpMacMap;
     
     // The internal staructure that contains the IP-MAC pairs. 
     IpMacMap ipMacMap;
-    uint16_t pingSeqNum;
-    uint16_t pingIdent;
-    static Syscall* sys;
-    const string lookupKernelArpCache(const uint32_t destIp,
-        const char* ifName);
-        
-    void updateKernelArpCache(const uint8_t* ethPkt);
-
-    
+    int fd;
     Context* context;
     Driver* driver;
+    struct sockaddr localAddress;
+    static Syscall* sys;
+
+    bool lookupKernelArpCache(const uint32_t destIp, const char* ifName,
+        EthernetHeader* ethHdr);
+        
+    void updateKernelArpCache(const uint8_t* ethPkt);
+    void sendUdpPkt(struct sockaddr* destAddress);
+
     DISALLOW_COPY_AND_ASSIGN(ArpCache);
 };
 } //namespace RAMCloud
