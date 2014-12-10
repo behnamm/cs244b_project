@@ -20,13 +20,21 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#include "EthernetUtil.h"
+#include "NetUtil.h"
 #include "Common.h"
 #include "ShortMacros.h"
 #include "FastTransport.h"
+#include "Syscall.h"
 
 namespace RAMCloud {
-namespace EthernetUtil {
+
+namespace NetUtil {
+
+/**
+ * Default object used to make system calls.
+ */
+static Syscall defaultSys;
+Syscall* SysCallWrapper::sys = &defaultSys;
 
 /**
  * This method uses IO control commands to find the mac address of an ethernet
@@ -43,6 +51,7 @@ namespace EthernetUtil {
 const string
 getLocalMac(const char* ifName)
 {
+    Syscall* sys = SysCallWrapper::sys;
 
     // The way we find mac address is by sending an IO control request of type
     // SIOCGIFHWADDR. The sturct ifreq will hold the response to that request.
@@ -53,24 +62,24 @@ getLocalMac(const char* ifName)
     if (if_name_len < sizeof(ifRequest.ifr_name)) {
         memcpy(ifRequest.ifr_name, ifName, if_name_len + 1);
     } else {
-        LOG(ERROR, "The interface name %s is too long!", ifName);
+        LOG(ERROR, "The interface name %s is too long.", ifName);
     }
 
     // For sending IO control request, we need to open a socket. Any type of
     // socket would suffice. If we can't open a socket, we'll die.
     int fd;
-    if ((fd = socket(AF_UNIX, SOCK_DGRAM, 0)) == -1) {
-        DIE("Can't open socket for doing IO control");
+    if ((fd = sys->socket(AF_UNIX, SOCK_DGRAM, 0)) == -1) {
+        DIE("Can't open socket for doing IO control.");
     }
 
     // Upon the successful return of the IO control, the ifreq struct will hold
     // the mac address.
-    if (ioctl(fd, SIOCGIFHWADDR, &ifRequest) == -1) {
-        close(fd);
+    if (sys->ioctl(fd, SIOCGIFHWADDR, &ifRequest) == -1) {
+        sys->close(fd);
         DIE("IO control request failed. Couldn't find the mac"
-            " address of the interface");
+            " address for ifName: %s", ifName);
     }
-    close(fd);
+    sys->close(fd);
     const unsigned char* mac =
         reinterpret_cast<unsigned char*>(ifRequest.ifr_hwaddr.sa_data);
 
@@ -93,6 +102,8 @@ getLocalMac(const char* ifName)
 const string
 getLocalIp(const char* ifName)
 {
+    Syscall* sys = SysCallWrapper::sys;
+
     // The way we find IP address is by sending an IO control request of type
     // SIOCGIFADDR. The sturct ifreq will hold the response to that request.
     struct ifreq ifRequest;
@@ -102,24 +113,24 @@ getLocalIp(const char* ifName)
     if (if_name_len < sizeof(ifRequest.ifr_name)) {
         memcpy(ifRequest.ifr_name, ifName, if_name_len + 1);
     } else {
-        LOG(ERROR, "The interface name %s is too long!", ifName);
+        LOG(ERROR, "The interface name %s is too long.", ifName);
     }
 
     // For sending IO control request, we need to open a socket of type AF_INET.
     // If we can't open a socket, we'll die.
     int fd;
-    if ((fd = socket(AF_INET, SOCK_DGRAM, 0)) == -1) {
-        DIE("Can't open socket for doing IO control");
+    if ((fd = sys->socket(AF_INET, SOCK_DGRAM, 0)) == -1) {
+        DIE("Can't open socket for doing IO control.");
     }
 
     // Upon the successful return of the IO control, the ifreq struct will hold
     // the IP address.
-    if (ioctl(fd, SIOCGIFADDR, &ifRequest) == -1) {
-        close(fd);
+    if (sys->ioctl(fd, SIOCGIFADDR, &ifRequest) == -1) {
+        sys->close(fd);
         DIE("IO control request failed. Couldn't find the mac"
-            " address of the interface");
+            " address for ifName: %s", ifName);
     }
-    close(fd);
+    sys->close(fd);
 
     struct sockaddr_in* ipaddr = (struct sockaddr_in*)&ifRequest.ifr_addr;
     return format("%s", inet_ntoa(ipaddr->sin_addr));
@@ -225,5 +236,5 @@ macToStr(const uint8_t* mac)
 }
 
 
-} //namespace EthernetUtil
+} //namespace NetUtil
 } //namespcae RAMCloud

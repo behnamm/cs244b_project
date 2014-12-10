@@ -17,16 +17,16 @@
 #include <ctype.h>
 #include <fstream>
 #include "TestUtil.h"
-#include "EthernetUtil.h"
+#include "NetUtil.h"
 #include "MockSyscall.h"
 #include "ArpCache.h"
 #include "Tub.h"
 
 namespace RAMCloud {
 
-using namespace EthernetUtil; //NOLINT 
+using namespace NetUtil; //NOLINT 
 
-class ArpCacheTest :public ::testing::Test {
+class ArpCacheTest : public ::testing::Test {
   public:
     Tub<ArpCache> arpCache;
     Context context;
@@ -58,6 +58,7 @@ class ArpCacheTest :public ::testing::Test {
 
     ~ArpCacheTest()
     {
+        ArpCache::sys = savedSys;
         delete mockSys;
     }
 
@@ -66,7 +67,7 @@ class ArpCacheTest :public ::testing::Test {
      * located at /proc/net/arp and parses the first entry on that table. It
      * extracts destination IP and MAC on that entry and saves them in remoteIp
      * and remoteMac parameters. These parameters will be used as reference
-     * values for testing. It also initializes localIp value.
+     * destination IP and MAC for testing. It also initializes localIp value.
      */
     void initialize(uint32_t *remoteIp, string& ifName, uint8_t *remoteMac) {
         std::ifstream arpFile("/proc/net/arp");
@@ -108,11 +109,146 @@ class ArpCacheTest :public ::testing::Test {
         localIp = inet_addr(ip.c_str());
     }
 
+  PRIVATE:
+    DISALLOW_COPY_AND_ASSIGN(ArpCacheTest);
+};
+
+TEST_F(ArpCacheTest, constructor_socketError) {
+    TestLog::Enable _;
+    ArpCache::sys = mockSys;
+    mockSys->socketErrno = EPERM;
+    try {
+        ArpCache arpCache1(&context, localIp, ifName.c_str());
+    } catch (ArpCacheException& e){
+        exceptionMsg = e.message;
+    }
+    EXPECT_EQ(exceptionMsg, "ArpCache could not create a socket for resolving"
+        " mac addresses!: Operation not permitted");
+    mockSys->socketErrno = 0;
+    ArpCache::sys = savedSys;
+}
+
+TEST_F(ArpCacheTest, constructor_failBind) {
+    TestLog::Enable _;
+    ArpCache::sys = mockSys;
+    mockSys->bindErrno = EADDRINUSE;
+    try {
+        ArpCache arpCache1(&context, localIp, ifName.c_str());
+    } catch (ArpCacheException& e){
+        exceptionMsg = e.message;
+    }
+    in_addr local = {localIp};
+    string expectedMsg = format("ArpCache could not bind the socket to"
+            " address %s: Address already in use", inet_ntoa(local));
+    EXPECT_EQ(exceptionMsg, expectedMsg);
+    mockSys->bindErrno = 0;
+    ArpCache::sys = savedSys;
+}
+
+TEST_F(ArpCacheTest, arpLookup_fromLocalCache) {
+    TestLog::Enable _;
+    MacAddress destAddress;
+    EXPECT_TRUE(arpCache->arpLookup(remoteIp, destAddress));
+    TestLog::reset();
+    EXPECT_TRUE(arpCache->arpLookup(remoteIp, destAddress));
+
+    sockaddr_in remote;
+    remote.sin_addr.s_addr = remoteIp;
+    string logMsg = format("arpLookup: Resolved MAC address for host %s through"
+        " local cache!", inet_ntoa(remote.sin_addr));
+    EXPECT_EQ(logMsg.c_str(), TestLog::get());
+    EXPECT_EQ(destAddress[0], remoteMac[0]);
+    EXPECT_EQ(destAddress[1], remoteMac[1]);
+    EXPECT_EQ(destAddress[5], remoteMac[5]);
+}
+
+TEST_F(ArpCacheTest, arpLookup_fromKernelCache) {
+    TestLog::Enable _;
+    MacAddress destAddress;
+    EXPECT_TRUE(arpCache->arpLookup(remoteIp, destAddress));
+    sockaddr_in remote;
+    remote.sin_addr.s_addr = remoteIp;
+    string logMsg = format("arpLookup: Resolved MAC address through kernel"
+        " calls for host at %s!", inet_ntoa(remote.sin_addr));
+    EXPECT_EQ(logMsg.c_str(), TestLog::get());
+    EXPECT_EQ(destAddress[0], remoteMac[0]);
+    EXPECT_EQ(destAddress[1], remoteMac[1]);
+    EXPECT_EQ(destAddress[5], remoteMac[5]);
+}
+
+TEST_F(ArpCacheTest, lookupKernelArpCache_ioctlError) {
+    TestLog::Enable _;
+    MacAddress destAddress;
+    ArpCache::sys = mockSys;
+    mockSys->ioctlErrno = -1;
+    EXPECT_FALSE(arpCache->lookupKernelArpCache(remoteIp, destAddress));
+    sockaddr_in remote;
+    remote.sin_addr.s_addr = remoteIp;
+    string errorMsg = format("lookupKernelArpCache: Can't perform ioctl on"
+            " kernel's ARP Cache for host at %s!", inet_ntoa(remote.sin_addr));
+    EXPECT_EQ(TestLog::get(), errorMsg.c_str());
+    mockSys->ioctlErrno = 0;
+    ArpCache::sys = savedSys;
+}
+
+TEST_F(ArpCacheTest, lookupKernelArpCache_retryMultipleTime) {
+    TestLog::Enable _;
+    MacAddress destAddress;
+    ArpCache::sys = mockSys;
+    mockSys->ioctlRetriesToSuccess = 2;
+    EXPECT_TRUE(arpCache->lookupKernelArpCache(remoteIp, destAddress));
+    sockaddr_in remote;
+    remote.sin_addr.s_addr = remoteIp;
+    string errorMsg =
+        format("lookupKernelArpCache: Kernel ARP cache entry for host at %s is"
+            " in use! Sleeping for %d us then retry for %dth time |"
+            " lookupKernelArpCache: Kernel ARP cache entry for host at %s is"
+            " in use! Sleeping for %d us then retry for %dth time",
+            inet_ntoa(remote.sin_addr), ArpCache::ARP_WAIT, 1,
+            inet_ntoa(remote.sin_addr), ArpCache::ARP_WAIT, 2);
+    EXPECT_EQ(TestLog::get(), errorMsg.c_str());
+    EXPECT_EQ(arpCache->ipMacMap[remoteIp][1], remoteMac[1]);
+
+    // Too many retries and no success. Returns false.
+    TestLog::reset();
+    mockSys->ioctlRetriesToSuccess = ArpCache::ARP_RETRIES + 1;
+    EXPECT_FALSE(arpCache->lookupKernelArpCache(remoteIp, destAddress));
+    ArpCache::sys = savedSys;
+}
+
+TEST_F(ArpCacheTest, sendUdpPkt) {
+    TestLog::Enable _;
+    ArpCache::sys = mockSys;
+    mockSys->sendtoReturnCount = 5;
+    sockaddr remote;
+    sockaddr_in* remoteAddr = reinterpret_cast<sockaddr_in*>(&remote);
+    remoteAddr->sin_addr.s_addr = remoteIp;
+    remoteAddr->sin_family = AF_INET;
+    arpCache->sendUdpPkt(&remote);
+    string errorMsg = format("sendUdpPkt: Tried to send UDP packet with 10"
+            " bytes but only %d bytes was sent!",
+            mockSys->sendtoReturnCount);
+    EXPECT_EQ(TestLog::get(), errorMsg.c_str());
+    mockSys->sendtoReturnCount = -1;
+    ArpCache::sys = savedSys;
+}
+
+class RouteTableTest : public :: testing::Test {
+  public:
+    string mockRouteFileName;
+
+    RouteTableTest()
+        : mockRouteFileName("/tmp/route")
+    {
+        mockRouteFile(mockRouteFileName.c_str());
+    }
+
+  PRIVATE:
     /**
-     * This method mocks a route file named fileName. This file is to be 
-     * used for testing RouteTable class. The route file content that is mocked
-     * by this method is as table below (in human readable format as terminal
-     * command "route -n" prints on stdout): 
+     * This method mocks a route file named fileName. This file is intended
+     * for testing RouteTable class. The route file content that is mocked by
+     * this method is formatted as table below (in human readable format as
+     * terminal command "route -n" prints on stdout): 
      * ------------------------------------------------------------------------
      * Destination     Gateway      Genmask         Flags Metric Ref  Use Iface
      * 192.168.100.0   0.0.0.0      255.255.255.0   U     0      0      0 eth2
@@ -154,121 +290,49 @@ class ArpCacheTest :public ::testing::Test {
         routeStream.close();
     }
 
-  PRIVATE:
-    DISALLOW_COPY_AND_ASSIGN(ArpCacheTest);
+    DISALLOW_COPY_AND_ASSIGN(RouteTableTest);
 };
 
-TEST_F(ArpCacheTest, constructor_socketError) {
-    ArpCache::sys = mockSys;
-    mockSys->socketErrno = EPERM;
-    try {
-        ArpCache arpCache1(&context, localIp, ifName.c_str());
-    } catch (Exception& e){
-        exceptionMsg = e.message;
-    }
-    EXPECT_EQ(exceptionMsg, "ArpCache could not open a socket for resolving"
-        " mac addresses!: Operation not permitted");
-    mockSys->socketErrno = 0;
-    ArpCache::sys = savedSys;
-}
-
-TEST_F(ArpCacheTest, constructor_failBind) {
-    ArpCache::sys = mockSys;
-    mockSys->bindErrno = EADDRINUSE;
-    try {
-        ArpCache arpCache1(&context, localIp, ifName.c_str());
-    } catch (Exception& e){
-        exceptionMsg = e.message;
-    }
-    in_addr local = {localIp};
-    string expectedMsg = format("ArpCache could not bind the socket to %s: "
-        "Address already in use", inet_ntoa(local));
-    EXPECT_EQ(exceptionMsg, expectedMsg);
-    mockSys->bindErrno = 0;
-    ArpCache::sys = savedSys;
-}
-
-TEST_F(ArpCacheTest, basics_fromKernelCache) {
-
-    TestLog::Enable _;
-    EthernetHeader ethHdr;
-    ethHdr.etherType = HTONS(EthernetType::IP_V4);
-    EXPECT_TRUE(arpCache->arpLookup(remoteIp, &ethHdr));
-    sockaddr_in remote;
-    remote.sin_addr.s_addr = remoteIp;
-    string logMsg = format("arpLookup: Resolved MAC address through kernel"
-        " calls for host at %s!", inet_ntoa(remote.sin_addr));
-    EXPECT_EQ(logMsg.c_str(), TestLog::get());
-    EXPECT_EQ(ethHdr.destAddress[0], remoteMac[0]);
-    EXPECT_EQ(ethHdr.destAddress[1], remoteMac[1]);
-    EXPECT_EQ(ethHdr.destAddress[5], remoteMac[5]);
-}
-
-TEST_F(ArpCacheTest, basics_fromLocalCache) {
-
-    TestLog::Enable _;
-    EthernetHeader ethHdr;
-    ethHdr.etherType = HTONS(EthernetType::IP_V4);
-    EXPECT_TRUE(arpCache->arpLookup(remoteIp, &ethHdr));
-    TestLog::reset();
-    EXPECT_TRUE(arpCache->arpLookup(remoteIp, &ethHdr));
-
-    sockaddr_in remote;
-    remote.sin_addr.s_addr = remoteIp;
-    string logMsg = format("arpLookup: Resolved MAC address for host %s through"
-        " local cache!", inet_ntoa(remote.sin_addr));
-    EXPECT_EQ(logMsg.c_str(), TestLog::get());
-    EXPECT_EQ(ethHdr.destAddress[0], remoteMac[0]);
-    EXPECT_EQ(ethHdr.destAddress[1], remoteMac[1]);
-    EXPECT_EQ(ethHdr.destAddress[5], remoteMac[5]);
-}
-
-TEST_F(ArpCacheTest, testRouteTableConstructor) {
-    const char* fileName = "/tmp/route";
-    mockRouteFile(fileName);
-    ArpCache::RouteTable routeTable2("eth2", fileName);
-    ArpCache::RouteTable::RouteEntry& entry = routeTable2.routeVector[0];
-    EXPECT_STREQ("eth2", entry.ifName);
-    EXPECT_EQ(downCast<uint32_t>(0x0064A8C0), entry.destIpRange);
+TEST_F(RouteTableTest, RouteTable_constructor) {
+    ArpCache::RouteTable routeTable1("eth2", mockRouteFileName.c_str());
+    ArpCache::RouteTable::RouteEntry& entry = routeTable1.routeVector[0];
+    EXPECT_EQ(downCast<uint32_t>(0x0064A8C0), entry.destNetworkIp);
     EXPECT_EQ(downCast<uint32_t>(0x00000000), entry.gatewayIp);
     EXPECT_EQ(downCast<uint32_t>(0x00FFFFFF), entry.netMask);
-    EXPECT_EQ(routeTable2.routeVector.size(), 2ul);
+    EXPECT_EQ(routeTable1.routeVector.size(), 2ul);
 
-    ArpCache::RouteTable routeTable3("eth3", fileName);
-    entry = routeTable3.routeVector[2];
-    EXPECT_STREQ("eth3", entry.ifName);
-    EXPECT_EQ(downCast<uint32_t>(0x00000000), entry.destIpRange);
+    ArpCache::RouteTable routeTable2("eth3", mockRouteFileName.c_str());
+    entry = routeTable2.routeVector[2];
+    EXPECT_EQ(downCast<uint32_t>(0x00000000), entry.destNetworkIp);
     EXPECT_EQ(downCast<uint32_t>(0x010342AB), entry.gatewayIp);
     EXPECT_EQ(downCast<uint32_t>(0x00000000), entry.netMask);
-    EXPECT_EQ(routeTable3.routeVector.size(), 3ul);
+    EXPECT_EQ(routeTable2.routeVector.size(), 3ul);
 
 }
 
-TEST_F(ArpCacheTest, getGatewayIp) {
-    const char* fileName = "/tmp/route";
-    mockRouteFile(fileName);
-    ArpCache::RouteTable routeTable0("eth0", fileName);
+TEST_F(RouteTableTest, getNextHopIp) {
+    ArpCache::RouteTable routeTable0("eth0", mockRouteFileName.c_str());
 
     // gateway for 10.10.10.10 is itself (longest prefix match rule on route
     // table above)
-    EXPECT_EQ(routeTable0.getGatewayIp(0x0A0A0A0A),
+    EXPECT_EQ(routeTable0.getNextHopIp(0x0A0A0A0A),
         downCast<uint32_t>(0x0A0A0A0A));
 
     // gateway for 10.10.11.10 is itself (no match for this IP in route table
-    // above so the gateway must must be same as destIp)
-    EXPECT_EQ(routeTable0.getGatewayIp(0x0A0B0A0A),
+    // above so the gateway must be returned same as destIp input arg)
+    EXPECT_EQ(routeTable0.getNextHopIp(0x0A0B0A0A),
         downCast<uint32_t>(0x0A0B0A0A));
 
-    ArpCache::RouteTable routeTable3("eth3", fileName);
+    ArpCache::RouteTable routeTable3("eth3", mockRouteFileName.c_str());
 
     // gateway for 171.66.3.10 is itself (longest prefix match rule)
-    EXPECT_EQ(routeTable3.getGatewayIp(0x0A0342AB),
+    EXPECT_EQ(routeTable3.getNextHopIp(0x0A0342AB),
         downCast<uint32_t>(0x0A0342AB));
 
     // gateway for 171.66.4.1 is at 171.66.3.1 (longest prefix match rule
     // on the last row of route table)
-    EXPECT_EQ(routeTable3.getGatewayIp(0x010442AB),
+    EXPECT_EQ(routeTable3.getNextHopIp(0x010442AB),
         downCast<uint32_t>(0x010342AB));
 }
 
-}
+} // namespace RAMCloud

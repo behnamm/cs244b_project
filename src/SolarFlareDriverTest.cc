@@ -19,75 +19,89 @@
 
 namespace RAMCloud {
 
-using namespace EthernetUtil; //NOLINT
+using namespace NetUtil; //NOLINT
 
-// Attention: this test only runs if you have SolarFalre NIC installed on
-// your machine. Also this test only runs if the NIC of the machine that is
-// running this test is connected to a switch.
+// N.B. this test only runs if you have SolarFalre NIC installed on
+// your machine.
 class SolarFlareDriverTest : public::testing::Test {
   public:
     Context context;
+    SolarFlareDriver* serverDriver;
+    SolarFlareDriver* clientDriver;
+    Driver::Address* serverAddress;
+
     SolarFlareDriverTest()
-        :context()
-    {}
+        : context()
+        , serverDriver(NULL)
+        , clientDriver(NULL)
+        , serverAddress(NULL)
+    {
+        serverDriver = new SolarFlareDriver(&context, NULL);
+        ServiceLocator serverLocator(serverDriver->localStringLocator.c_str());
+        clientDriver = new SolarFlareDriver(&context, NULL);
+        serverAddress = clientDriver->newAddress(serverLocator);
+    }
+
+    ~SolarFlareDriverTest()
+    {
+        delete serverAddress;
+        delete serverDriver;
+        delete clientDriver;
+    }
 
   private:
     DISALLOW_COPY_AND_ASSIGN(SolarFlareDriverTest);
 };
 
-TEST_F(SolarFlareDriverTest, sendPacket_zeroCopy) {
-    SolarFlareDriver* serverDriver =
-        new SolarFlareDriver(&context, NULL);
-    ServiceLocator serverLocator(serverDriver->localStringLocator.c_str());
+TEST_F(SolarFlareDriverTest, sendPacket_zeroCopyNoPayload) {
 
-    SolarFlareDriver* clientDriver =
-        new SolarFlareDriver(&context, NULL);
-    Driver::Address* serverAddress = clientDriver->newAddress(serverLocator);
+    // Register an arbitrary memory chunk to the NIC.
     uint32_t regBytes = 4096 * (1 << 4);
     void* memoryChunk = Memory::xmemalign(HERE, 4096, regBytes);
     clientDriver->registerMemory(memoryChunk, regBytes);
 
-    // Testing for the case where header is not part of log memory.
+    // Defining the header and sending the packet.
     TestLog::Enable _;
     SolarFlareDriver::PacketBuff* pktBuff =
-        clientDriver->txBufferPool->freeBufferList;
-        string hdr = "header:";
+        clientDriver->txBufferPool->freeBuffersVec.back();
+    string hdr = "header:";
     size_t l2AndL3HdrSize =
         sizeof(EthernetHeader) + sizeof(IpHeader) + sizeof(UdpHeader);
     size_t totalHdrSize = l2AndL3HdrSize + hdr.size();
     clientDriver->sendPacket(serverAddress, hdr.c_str(),
-        downCast<uint32_t>(hdr.size()), NULL);
+            downCast<uint32_t>(hdr.size()), NULL);
     string logStr =
         format("sendPacket: Total number of IoVecs are 1 |"
         " sendPacket: IoVec 0 starting at %lu and size %lu",
         pktBuff->dmaBufferAddress, totalHdrSize);
     EXPECT_EQ(logStr.c_str(), TestLog::get());
 
-    // Testing for when header is part of log memory
-    TestLog::reset();
-    int offset = 100;
-    char* header = reinterpret_cast<char*>(memoryChunk) + offset;
-    uint32_t headerLen = 100;
-    ef_addr headerDmaAddr =
-        ef_memreg_dma_addr(&clientDriver->logMemoryReg, offset);
-    pktBuff = clientDriver->txBufferPool->freeBufferList;
-    clientDriver->sendPacket(serverAddress, header, headerLen, NULL);
-    logStr =
-        format("sendPacket: Total number of IoVecs are 2 |"
-        " sendPacket: IoVec 0 starting at %lu and size %lu |"
-        " sendPacket: IoVec 1 starting at %lu and size %u",
-        pktBuff->dmaBufferAddress, l2AndL3HdrSize, headerDmaAddr, headerLen);
-    EXPECT_EQ(logStr.c_str(), TestLog::get());
+    free(memoryChunk);
+}
 
-    // Testing for when there are three pieces of payload. First and last
-    // pieces are not part of log memory but second piece is part of log memory.
-    TestLog::reset();
+TEST_F(SolarFlareDriverTest, sendPacket_zeroCopyMultiplePayloadChunks) {
+
+    // Register an arbitrary memory chunk to the NIC.
+    uint32_t regBytes = 4096 * (1 << 4);
+    void* memoryChunk = Memory::xmemalign(HERE, 4096, regBytes);
+    clientDriver->registerMemory(memoryChunk, regBytes);
+
+    // Test  there are three pieces of payload. First and last pieces are
+    // not part of log memory but the middle piece is part of log memory.
+    string hdr = "header:";
+    size_t l2AndL3HdrSize =
+        sizeof(EthernetHeader) + sizeof(IpHeader) + sizeof(UdpHeader);
+    size_t totalHdrSize = l2AndL3HdrSize + hdr.size();
+
     Buffer buffer;
     uint32_t dataSubLen = 300;
+
+    // The piece of payload that is not inside the registered memory region.
     char* nonRegisteredData1 = reinterpret_cast<char*>(malloc(dataSubLen));
     buffer.appendExternal(nonRegisteredData1, dataSubLen);
 
-    uint32_t registeredDataOffset = 2 * offset + headerLen;
+    // The two pieces of payload that are inside the registered memory region.
+    uint32_t registeredDataOffset = 100;
     char* registeredData =
         reinterpret_cast<char*>(memoryChunk) + registeredDataOffset;
     buffer.appendExternal(registeredData, dataSubLen);
@@ -96,28 +110,28 @@ TEST_F(SolarFlareDriverTest, sendPacket_zeroCopy) {
     buffer.appendExternal(nonRegisteredData2, dataSubLen);
 
     Buffer::Iterator payload(&buffer);
-    pktBuff = clientDriver->txBufferPool->freeBufferList;
-    clientDriver->sendPacket(serverAddress, header, headerLen, &payload);
-    logStr =
-        format("sendPacket: Total number of IoVecs are 5 |"
+    SolarFlareDriver::PacketBuff* pktBuff =
+        clientDriver->txBufferPool->freeBuffersVec.back();
+
+    TestLog::Enable _;
+    TestLog::reset();
+    clientDriver->sendPacket(serverAddress, hdr.c_str(),
+            downCast<uint32_t>(hdr.size()), &payload);
+    string logStr =
+        format("sendPacket: Total number of IoVecs are 4 |"
         " sendPacket: IoVec 0 starting at %lu and size %lu |"
         " sendPacket: IoVec 1 starting at %lu and size %u |"
         " sendPacket: IoVec 2 starting at %lu and size %u |"
-        " sendPacket: IoVec 3 starting at %lu and size %u |"
-        " sendPacket: IoVec 4 starting at %lu and size %u",
-        pktBuff->dmaBufferAddress, l2AndL3HdrSize, headerDmaAddr, headerLen,
-        pktBuff->dmaBufferAddress + l2AndL3HdrSize, dataSubLen,
+        " sendPacket: IoVec 3 starting at %lu and size %u",
+        pktBuff->dmaBufferAddress, totalHdrSize,
+        pktBuff->dmaBufferAddress + totalHdrSize, dataSubLen,
         ef_memreg_dma_addr(&clientDriver->logMemoryReg, registeredDataOffset),
         dataSubLen,
-        pktBuff->dmaBufferAddress + l2AndL3HdrSize + dataSubLen, dataSubLen);
+        pktBuff->dmaBufferAddress + totalHdrSize + dataSubLen, dataSubLen);
     EXPECT_EQ(logStr.c_str(), TestLog::get());
-    TestLog::reset();
 
     free(nonRegisteredData1);
     free(nonRegisteredData2);
-    delete serverAddress;
-    delete serverDriver;
-    delete clientDriver;
     free(memoryChunk);
 }
 

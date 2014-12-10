@@ -13,16 +13,14 @@
  * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
  */
 
-
 #include <net/if_arp.h>
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <fstream>
 #include "ArpCache.h"
-#include "EthernetUtil.h"
+#include "NetUtil.h"
 #include "Common.h"
 #include "ShortMacros.h"
-
 
 namespace RAMCloud {
 
@@ -38,24 +36,22 @@ static Syscall defaultSyscall;
  */
 Syscall* ArpCache::sys = &defaultSyscall;
 
-
-using namespace EthernetUtil; //NOLINT
-
 /**
  * Constructor for ArpCache object.
  *
  * \param context
  *      Overall and shared information about RAMCloud client or server.
  * \param localIp
- *      The 32 bit IP address in netwrork byte order of the source. This is the
- *      ip address used as source ip in the header of every outgoing packet 
- *      that is transmitted from the driver that owns this instance of ARP
- *      Cache. 
+ *      The 32 bit IP address in network byte order needed to send UDP packets
+ *      for triggering the ARP module in kernel. It corresponds to the interface
+ *      that will be used to send packets (ie. `ifName').
  * \param ifName
- *      The name of network interface that owns localIp address.
+ *      The name of network interface in the local machine that owns localIp
+ *      address. The ARP translations provided by this module are only valid for
+ *      this interface.
  * \param routeFile
- *      The full name (including path) for Kernel's route table file. This
- *      file in most of linux distros is "/proc/net/route"
+ *      The full name (including absolute path) for Kernel's route table file.
+ *      This file, in most of Linux distros, is "/proc/net/route"
  */
 ArpCache::ArpCache(Context* context, const uint32_t localIp,
         const char* ifName, const char* routeFile)
@@ -72,62 +68,70 @@ ArpCache::ArpCache(Context* context, const uint32_t localIp,
     local->sin_family = AF_INET;
     local->sin_addr.s_addr = localIp;
 
-    // Let the kernel choose a port when we create the socket
+    // By setting port to 0, we let the Kernel choose a port when we bind the
+    // socket.
     local->sin_port = HTONS(0);
     fd = sys->socket(AF_INET, SOCK_DGRAM, 0);
-    if (fd < 0) {
-        throw Exception(HERE, "ArpCache could not open a socket for"
-            " resolving mac addresses!", errno);
+    if ((fd = sys->socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+        string msg =
+            "ArpCache could not create a socket for resolving mac addresses!";
+        LOG(WARNING, "%s", msg.c_str());
+        throw ArpCacheException(HERE, msg.c_str(), errno);
     }
 
     int r = sys->bind(fd, &localAddress, sizeof(localAddress));
     if (r < 0) {
-        string msg = format("ArpCache could not bind the socket to %s",
+        string msg = format("ArpCache could not bind the socket to address %s",
             inet_ntoa(local->sin_addr));
-        throw Exception(HERE, msg.c_str(), errno);
+        LOG(WARNING, "%s", msg.c_str());
+        throw ArpCacheException(HERE, msg.c_str(), errno);
     }
 
-    if ((fdArp = sys->socket(AF_INET, SOCK_DGRAM, 0)) == -1) {
-        throw Exception(HERE, "Can't open socket for performing "
-            "IO control", errno);
+    if ((fdArp = sys->socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+        string msg =
+            "ArpCache could not create socket for performing IO control";
+        LOG(WARNING, "%s", msg.c_str());
+        throw ArpCacheException(HERE, msg.c_str(), errno);
     }
 }
 
 /**
- * This function is the lookup interface of the ArpCache that is exposed 
- * to the users (driver code). 
- *  
+ * Destructor of ArpCache object. 
+ */
+ArpCache::~ArpCache()
+{
+    sys->close(fd);
+    fd = -1;
+    sys->close(fdArp);
+    fdArp = -1;
+}
+
+/**
+ * Given a destination IP address this method returns the corresponding MAC
+ * address. (ie. The packet must be sent to this MAC address to reach the
+ * destination IP address).
  * \param destIp 
- *      32 bit destination ip (in network byte order) for which we want to
- *      resolve the MAC address.
- * \param ethHdr
- *      Pointer to the Ethernet header of Ehternet frame that is to be sent to
- *      the destIp. After this function successfully returns the destination
- *      address (destAddr field in the header) will be filled with the 
- *      appropriate MAC address for the destIp.
+ *      32 bit destination IP (in network byte order) for which we want to
+ *      resolve the next hop MAC address.
+ * \param destMac 
+ *      Pointer to the destination MAC address to be resolved by this method.
+ *      If this method returns true, the value that this pointer points to will
+ *      contain the 6 bytes MAC address corresponding to destIp address or
+ *      the gateway MAC address needed to reach destIp.
  *  \return
  *      True means that we have successfully resolved the MAC address and copied
- *      it over to destAddr field of ethHdr param. False, means that the
- *      function couldnot resolve MAC address. The failure of this method is
- *      assumed to be handles by higher level transport code. 
+ *      it over to the address destMac points to. False, means that the function
+ *      could not resolve the MAC address and presumably the higher level code
+ *      will eventually time out and retry.
  */
 bool
-ArpCache::arpLookup(const uint32_t destIp, EthernetHeader* ethHdr)
+ArpCache::arpLookup(const uint32_t destIp, MacAddress destMac)
 {
 
-    // It first tries to resolve the MAC address from local cache, if failed,
-    // looks it up from kernel ARP cache, and if that fails too, triggers the
-    // ARP module in the kernel to resolve that MAC address through the ARP
-    // protocol and then resolves the MAC address from kernel cache. The last
-    // will get retried for ARP_RETRIES times in ARP_WAIT micro second intervals
-    // until it succeeds. If it doesn't succeed the function returns false.
-
+    // First see if we have a valid cached translation for this address.
     IpMacMap::iterator mapEntry = ipMacMap.find(destIp);
-
-    // Lookup MAC in local cache.
-    if (mapEntry != ipMacMap.end() && mapEntry->second.valid) {
-        memcpy(ethHdr->destAddress, mapEntry->second.macAddress,
-               sizeof(ethHdr->destAddress));
+    if (mapEntry != ipMacMap.end()) {
+        memcpy(destMac, mapEntry->second.data(), NetUtil::MAC_ADDR_LEN);
 #if TESTING
         sockaddr_in remote;
         remote.sin_addr.s_addr = destIp;
@@ -135,80 +139,71 @@ ArpCache::arpLookup(const uint32_t destIp, EthernetHeader* ethHdr)
             inet_ntoa(remote.sin_addr));
 #endif
         return true;
+    }
+
+    sockaddr destAddress;
+    struct sockaddr_in* destAddr =
+        reinterpret_cast<sockaddr_in*>(&destAddress);
+    destAddr->sin_addr.s_addr = destIp;
+
+    // No valid cached translation was found in the local cache; See if we can
+    // get a translation from Kernel's cache.
+    if (lookupKernelArpCache(destIp, destMac)) {
+        TEST_LOG("Resolved MAC address through kernel calls for host at"
+            " %s!", inet_ntoa(destAddr->sin_addr));
+        return true;
+    }
+
+    // The kernel doesn't seem to have a translation either. From Kernel socket,
+    // Send a UDP packets to the destination. This will trigger the ARP module
+    // in the Kernel and cause the Kernel to make a new entry in its ARP cache.
+    destAddr->sin_family = AF_INET;
+
+    // Could be any port. It doesn't matter which port to choose.
+    destAddr->sin_port = HTONS(80);
+    sendUdpPkt(&destAddress);
+    if (lookupKernelArpCache(destIp, destMac)) {
+
+        // Successfully resolved the MAC address from Kernel cache.
+        TEST_LOG("Resolved MAC address through kernel calls and ARP"
+            " packets for host at %s!", inet_ntoa(destAddr->sin_addr));
+        return true;
     } else {
-
-        // Resolve the gateway address for destination destIp
-        uint32_t gatewayIp = routeTable.getGatewayIp(destIp);
-        sockaddr_in remote;
-        remote.sin_addr.s_addr = destIp;
-
-        if (lookupKernelArpCache(gatewayIp, ethHdr)) {
-            // Lookup MAC in Kernel ARP cache for the gateway. If successful,
-            // update the local cache too.
-            ArpEntry& arpEntry = ipMacMap[destIp];
-            arpEntry.valid = true;
-            memcpy(arpEntry.macAddress, ethHdr->destAddress,
-                sizeof(arpEntry.macAddress));
-
-            LOG(NOTICE, "Resolved MAC address through kernel calls for host at"
-                " %s!", inet_ntoa(remote.sin_addr));
-            return true;
-        }
-
-        ArpEntry& arpEntry = ipMacMap[destIp];
-        struct sockaddr_in* destAddr =
-            reinterpret_cast<sockaddr_in*>(&arpEntry.address);
-
-        destAddr->sin_addr.s_addr = destIp;
-        destAddr->sin_family = AF_INET;
-        destAddr->sin_port = HTONS(static_cast<uint16_t>(generateRandom()));
-
-        // Send a UDP packet to the destAddr which causes the kernel ARP
-        // module to get triggered which updates kernel's ARP cache.
-        sendUdpPkt(&arpEntry.address);
-        if (!lookupKernelArpCache(gatewayIp, ethHdr)) {
-            LOG(WARNING, "No success in resolving MAC address for host at %s!",
-                inet_ntoa(remote.sin_addr));
-
-            return false;
-        } else {
-            // Update local cache and return true.
-            memcpy(arpEntry.macAddress, ethHdr->destAddress,
-                sizeof(arpEntry.macAddress));
-            arpEntry.valid = true;
-            LOG(NOTICE, "Resolved MAC address through kernel calls and ARP"
-                " packets for host at %s!", inet_ntoa(remote.sin_addr));
-            return true;
-        }
+        LOG(WARNING, "No success in resolving MAC address for host at %s!",
+            inet_ntoa(destAddr->sin_addr));
+        return false;
     }
 }
 
 /**
- * This method uses IO control command to lookup MAC address for a destination
- * IP address using Kernel's ARP cache. If the IO control fails, then the
- * function keeps trying for ARP_RETRIES times in ARP_WAIT micro sec intervals.
+ * This method looks up MAC address for a destination IP address from Kernel's
+ * ARP cache. If the corresponding MAC address is found, it will returns the
+ * MAC address and also updates the local ARP cache.
  *
  * \param destIp 
- *      32 bit destination ip ( in network byte order) for which we want to
+ *      32 bit destination IP (in network byte order) for which we want to
  *      resolve the MAC address.
- * \param ethHdr
- *      Pointer to the Ethernet header of Ehternet frame that is to be sent to
- *      the destIp. After this function successfully returns the destination
- *      address (destAddr field in the header) will be filled with the 
- *      appropriate MAC address for the destIp.
+ * \param destMac 
+ *      Pointer to the destination MAC address to be resolved by this method.
+ *      If this method returns true, the value that this pointer points to will
+ *      contain either the 6 bytes MAC address corresponding to destIp address
+ *      or the gateway MAC address needed to reach destIp.
  * \return
  *      True means that we have successfully resolved the MAC address and copied
- *      it over to destAddr field of ethHdr param. False, means that the
- *      function could not resolve MAC address as a result of one of these two 
- *      reasons:
- *      1) there is no entry match for destIp in Kernel's ARP cache. 
- *      2) There is an entry but it's either in busy state (meaning that it's
- *      being used by kernel) or it's not complete (meaning that the entry is
- *      not yes fully updated and ARP response packet has not yet been received)
+ *      it over to `destMac' param. False, means that the method was not able
+ *      to resolve the MAC address in a timely manner. In some cases retrying
+ *      later will resolve the address but in other cases (ie. The destIp is
+ *      bogus) the MAC address wont be resolved at all.
  */
 bool
-ArpCache::lookupKernelArpCache(const uint32_t destIp, EthernetHeader* ethHdr)
+ArpCache::lookupKernelArpCache(const uint32_t destIp, MacAddress destMac)
 {
+
+    // We first need to figure out if the destIp is on the same subnet as the
+    // local machine; If not, we have to resolve gateway IP address since the
+    // Kernel ARP cache only describes the MAC addresses of the machines on the
+    // same subnet.
+    uint32_t gatewayIp = routeTable.getNextHopIp(destIp);
     struct arpreq arpReq;
     memset(&arpReq, 0, sizeof(arpReq));
 
@@ -216,27 +211,33 @@ ArpCache::lookupKernelArpCache(const uint32_t destIp, EthernetHeader* ethHdr)
         reinterpret_cast<sockaddr_in*>(&arpReq.arp_pa);
 
     sin->sin_family = AF_INET;
-    sin->sin_addr.s_addr = destIp;
+    sin->sin_addr.s_addr = gatewayIp;
     snprintf(arpReq.arp_dev, sizeof(arpReq.arp_dev), "%s", this->ifName);
 
-    int atfFlagCompleted = 0x02;
+    int atfFlagCompleted = ATF_COM;
 
     for (int r = 0; r < ARP_RETRIES; r++) {
 
         if (sys->ioctl(fdArp, SIOCGARP, &arpReq) == -1) {
-            LOG(NOTICE, "Can't perform ioctl on kernel's ARP Cache for"
+            LOG(WARNING, "Can't perform ioctl on kernel's ARP Cache for"
                 " host at %s!", inet_ntoa(sin->sin_addr));
             return false;
         }
 
-        // If the ioctl, we wait for some time and try again.
         if (arpReq.arp_flags & atfFlagCompleted) {
+
             uint8_t* mac =
                 reinterpret_cast<uint8_t*>(&arpReq.arp_ha.sa_data[0]);
-            memcpy(ethHdr->destAddress, mac, sizeof(ethHdr->destAddress));
+            memcpy(destMac, mac, NetUtil::MAC_ADDR_LEN);
+
+            // Update the local ARP cache too.
+            MacArray& macArray = ipMacMap[destIp];
+            memcpy(macArray.data(), destMac, NetUtil::MAC_ADDR_LEN);
             return true;
         } else {
-            LOG(NOTICE, "Kernel ARP cache entry for host at %s is in use!"
+
+            // If the ioctl failed, we wait for some time and try again.
+            LOG(WARNING, "Kernel ARP cache entry for host at %s is in use!"
                 " Sleeping for %d us then retry for %dth time",
                 inet_ntoa(sin->sin_addr), ARP_WAIT, r+1);
             usleep(ARP_WAIT);
@@ -257,15 +258,13 @@ void
 ArpCache::sendUdpPkt(struct sockaddr* destAddress)
 {
     string udpPkt = "dummy msg!";
-
-    // send the udp request packet out on the socket
     int sentBytes =
         downCast<int>(sys->sendto(fd, udpPkt.c_str(), udpPkt.length(),
-            0, destAddress, sizeof(struct sockaddr)));
+                0, destAddress, sizeof(struct sockaddr)));
 
     if (sentBytes != downCast<int>(udpPkt.length())) {
-        LOG(WARNING, "ARP UDP packet sent %d bytes. Pakcet lenght was %d",
-            sentBytes, downCast<int>(udpPkt.length()));
+        LOG(WARNING, "Tried to send UDP packet with %d bytes but only %d bytes"
+                " was sent!", downCast<int>(udpPkt.length()), sentBytes);
     }
 }
 
@@ -273,43 +272,74 @@ ArpCache::sendUdpPkt(struct sockaddr* destAddress)
  * Constructor for RouteTable class. This basically iterates over the Kernel's
  * route table and fills out the internal route table structure of this class
  * based on the information in Kernel's route file.
- * The Kernel's route file in linux is formatted as below:
- * ----------------------------------------------------------------------------
- * Iface  Destination  Gateway  Flags RefCnt Use Metric  Mask    MTU Window IRTT
- *
- *  eth2   0064A8C0    00000000  0001   0     0     0  00FFFFFF   0    0     0 
- * ----------------------------------------------------------------------------
- *  All the IP values in this route file are recorded as 32bit values in network
- *  byte order as in the above example.
  *
  * \param ifName
- *      The interface name for which we want to keep the route inforamtion
+ *      The interface name for which we want to keep the route information
  *      provided in the Kernel's route table.
  * \param routeFile
  *      Name (including the full path) to the file that contains Kernel's route
- *      table (as specified in table above). In most Linux ditstros this file is
- *      located at /proc/net/route.
+ *      table. In most Linux ditstros this file is located at /proc/net/route.
  */
 ArpCache::RouteTable::RouteTable(const char* ifName, const char* routeFile)
     :routeVector()
 {
+
+    //  In layer 3 networking, the Kernel ARP cache only contains the MAC
+    //  address of the machines that are on the same subnet as the local
+    //  machine.  The purpose of route file in Kernel and also RouteTable class
+    //  here is to provide a way to resolve the gateway IP for any arbitrary
+    //  destination IP address. Then using the ARP table and the resolved
+    //  gateway IP, we can resolve the next hop MAC address in the network for
+    //  that destination IP.
+
     std::ifstream routeStream(routeFile);
     string line;
-    getline(routeStream, line);
     std::vector<string> routeVec;
     RouteEntry routeEntry;
 
-    // Iterate over all the lines in the routeFile and parse out the paramaters
-    // the parameters in the file. writes the parsed parameters in routeVec
-    // vector.
+    // The Kernel's route file in linux is formatted as below:
+    // -------------------------------------------------------------------------
+    // Iface  Destination  Gateway  Flags RefCnt Use Metric Mask    MTU Win IRTT
+    //
+    //  eth2   0064A8C0    00000000  0001   0     0     0  00FFFFFF  0   0    0
+    // -------------------------------------------------------------------------
+    // First line is the header and the rest of the lines contain the values
+    // for different field in the header. The lines provide routing
+    // information for different destination networks.
+    // All the IP values in the route file are recorded as 32bit values in
+    // network byte order like the above example.
+    //
+    // Terminal command "route -n" in Linux, prints out the Kernel's route file
+    // in human readable format as below:
+    // ------------------------------------------------------------------------
+    //  Destination     Gateway      Genmask         Flags Metric Ref  Use Iface
+    //  192.168.100.0   0.0.0.0      255.255.255.0   U     0      0      0  eth2
+    // ------------------------------------------------------------------------
+    // Please refer to any Linux networking manual for complete explanation of
+    // different fields in Kernel's route file.
+
+    // The first line of the routeFile is the header. So we read it out and
+    // discard it.
+    getline(routeStream, line);
+
+    // Iterate over remaining lines in the routeFile and parse out the
+    // parameters in the file and writes the parsed parameters in routeVec.
     while (getline(routeStream, line)) {
         routeVec.clear();
         while (line.size()) {
+
+            // As long as there are still non-empty string words left in the
+            // line, parse out that word and push it to the back of routeVec.
             for (size_t pos = 0; pos < line.size(); ++pos) {
                 if (isspace(line[pos])) {
                     if (pos == 0) {
+
+                        // Erase the spaces at beginning of the line.
                         line.erase(0, 1);
                     } else {
+
+                        // Push back the word that comes before the current
+                        // space.
                         routeVec.push_back(line.substr(0, pos));
                         line.erase(0, pos);
                     }
@@ -317,19 +347,30 @@ ArpCache::RouteTable::RouteTable(const char* ifName, const char* routeFile)
                 }
 
                 if (pos == line.size() - 1) {
+
+                    // There is a word at the end of the file with no space
+                    // after it. Push that to routeVec too.
                     routeVec.push_back(line);
                     line.erase();
                 }
             }
         }
 
+        // The expected number of fields in each line is 11, where the first
+        // field is the interface name, the 2nd field is destination network IP,
+        // the 3rd field is the gateway IP for that destination IP and the
+        // 8th field is the netmask for that destination IP.
+        if (routeVec.size() != 11) {
+            LOG(WARNING, "The parsed line from routeFile has %zu line however"
+            " we expect 11 fields in standard Linux Kernel's routeFile!",
+            routeVec.size());
+        }
+
         // If the interface name for the line that we just parsed out from
-        // routeFile is same as the ifName, then we will keep that route entry
-        // in our local route table.
+        // routeFile matches the ifName argument, then we will keep that
+        // route entry in our local route table.
         if (strcmp(routeVec[0].c_str(), ifName) == 0) {
-            snprintf(routeEntry.ifName, sizeof(routeEntry.ifName),
-                "%s", ifName);
-            routeEntry.destIpRange =
+            routeEntry.destNetworkIp =
                 downCast<uint32_t>(strtoul(routeVec[1].c_str(), NULL, 16));
             routeEntry.gatewayIp =
                 downCast<uint32_t>(strtoul(routeVec[2].c_str(), NULL, 16));
@@ -338,32 +379,37 @@ ArpCache::RouteTable::RouteTable(const char* ifName, const char* routeFile)
             routeVector.push_back(routeEntry);
         }
     }
+
+    if (!routeVector.size()) {
+        LOG(WARNING, "RouteTable contains no entry for %s interface!", ifName);
+    }
 }
 
 /**
- * This method takes in a distanation IP and looks up the gateway IP for that
- * destination. This method only searched the local cache of route table for the
- * interface name that was specified as the input argument of constructor for
- * RouteTable class. This method uses longest prefix matching as the mathcing
- * rule for finding the gateway IP.
+ * This method returns the IP address of a machine on a local subnet where we
+ * should send the packet to reach a desired destination. (ie. Either the
+ * destination itself or a gateway)
  *
  * \param destIp
  *      32 bit IP address (in network byte order) of the destination that we
  *      want to gateway IP for it.
  * \return
- *      32 bit IP address (in network byte order) of the gateway. If function
- *      finds a nonzero gateway based on the longest prefix matching rule, then
- *      it returns it. Otherwise, it will return the input argument destIp as
- *      the gateway address.
+ *      32 bit IP address (in network byte order) of the next hop that the
+ *      packet must be sent to in order to reach destIp address. If function
+ *      finds a nonzero gateway, then it returns it. Otherwise, it will return
+ *      the input argument destIp as the next hop IP address.
  */
 uint32_t
-ArpCache::RouteTable::getGatewayIp(const uint32_t destIp)
+ArpCache::RouteTable::getNextHopIp(const uint32_t destIp)
 {
     uint32_t mask = 0;
     uint32_t gateway = 0;
     for (size_t i = 0; i < routeVector.size(); ++i) {
         RouteEntry& entry = routeVector[i];
-        if ((entry.destIpRange & entry.netMask) == (destIp & entry.netMask) &&
+
+        // Performing longest prefix matching as the matching rule for finding
+        // the gateway IP (next hop in the network).
+        if ((entry.destNetworkIp & entry.netMask) == (destIp & entry.netMask) &&
                 entry.netMask >= mask) {
             mask = entry.netMask;
             gateway = entry.gatewayIp;

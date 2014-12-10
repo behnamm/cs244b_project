@@ -20,6 +20,7 @@
 #include <netinet/in.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <net/if_arp.h>
 
 #include "Common.h"
 #include "Syscall.h"
@@ -38,10 +39,11 @@ class MockSyscall : public Syscall {
                     epollWaitCount(-1), epollWaitEvents(NULL),
                     epollWaitErrno(0), exitCount(0),
                     fcntlErrno(0), futexWaitErrno(0), futexWakeErrno(0),
-                    fwriteResult(~0LU), ioctlErrno(0), listenErrno(0),
-                    pipeErrno(0), recvErrno(0), recvEof(false),
+                    fwriteResult(~0LU), ioctlErrno(0), ioctlRetriesToSuccess(0),
+                    listenErrno(0), pipeErrno(0), recvErrno(0), recvEof(false),
                     recvfromErrno(0), recvfromEof(false),
                     sendmsgErrno(0), sendmsgReturnCount(-1),
+                    sendtoErrno(0), sendtoReturnCount(-1),
                     setsockoptErrno(0), socketErrno(0), writeErrno(0) {}
 
     int acceptErrno;
@@ -168,12 +170,21 @@ class MockSyscall : public Syscall {
     }
 
     int ioctlErrno;
+    int ioctlRetriesToSuccess;
     int ioctl(int fd, int reqType, void* request) {
-        if (ioctlErrno == 0) {
+        if (ioctlErrno != 0) {
+            errno = ioctlErrno;
+            return -1;
+        } else if (reqType == SIOCGARP && ioctlRetriesToSuccess > 0) {
+
+            // Simulates when kernel ARP cache is busy and not accessible.
+            ioctlRetriesToSuccess--;
+            struct arpreq* arpReq = reinterpret_cast<struct arpreq*>(request);
+            arpReq->arp_flags = 0;
+            return 0;
+        } else {
             return ::ioctl(fd, reqType, request);
         }
-        errno = ioctlErrno;
-        return -1;
     }
 
     int listenErrno;
@@ -232,6 +243,19 @@ class MockSyscall : public Syscall {
             return sendmsgReturnCount;
         }
         return ::sendmsg(sockfd, msg, flags);
+    }
+
+    int sendtoErrno;
+    int sendtoReturnCount;
+    ssize_t sendto(int socket, const void *buffer, size_t length, int flags,
+           const struct sockaddr *destAddr, socklen_t destLen) {
+        if (sendtoErrno != 0) {
+            errno = sendtoErrno;
+            return -1;
+        } else if (sendtoReturnCount >= 0) {
+            return sendtoReturnCount;
+        }
+        return ::sendto(socket, buffer, length, flags, destAddr, destLen);
     }
 
     int setsockoptErrno;

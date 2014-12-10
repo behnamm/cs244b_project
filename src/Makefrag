@@ -25,7 +25,6 @@ endif
 ifeq ($(ONLOAD),yes)
 SOLARFLARE_SRC := \
 	src/SolarFlareDriver.cc \
-	src/SolarFlareAddress.cc \
 	$(NULL)
 else
 SOLARFLARE_SRC :=
@@ -60,7 +59,7 @@ SHARED_SRCFILES := \
 		   src/ZooStorage.cc \
 		   src/Enumeration.cc \
 		   src/EnumerationIterator.cc \
-		   src/EthernetUtil.cc \
+		   src/NetUtil.cc \
 		   src/ExternalStorage.cc \
 		   src/FailureDetector.cc \
 		   src/FailSession.cc \
@@ -82,6 +81,7 @@ SHARED_SRCFILES := \
 		   src/Logger.cc \
 		   src/LogIterator.cc \
 		   src/MacAddress.cc \
+		   src/MacIpAddress.cc \
 		   src/MasterClient.cc \
 		   src/MasterService.cc \
 		   src/MasterTableMetadata.cc \

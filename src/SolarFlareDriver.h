@@ -25,9 +25,9 @@
 #include "Common.h"
 #include "Dispatch.h"
 #include "Driver.h"
-#include "EthernetUtil.h"
+#include "NetUtil.h"
 #include "ObjectPool.h"
-#include "SolarFlareAddress.h"
+#include "MacIpAddress.h"
 #include "ServiceLocator.h"
 #include "ShortMacros.h"
 #include "Transport.h"
@@ -35,19 +35,17 @@
 
 namespace RAMCloud {
 
-using namespace EthernetUtil; //NOLINT
 
 /**
-* A simple driver for SolarFlare NICs to send and receive unreliable datagrams. 
-* This driver does not provide any reliability guarantees and intended to be
-* used with higher level transport code (eg FastTransport)
-* See Driver.h for some more details.
-*/
-
-/// This macro forces the compiler to align allocated memory to the cash line
-/// size. This is necessary as a performance boost for the data portion of
-/// packet buffers.
-#define CACHE_ALIGN  __attribute__((aligned(CACHE_LINE_SIZE)))
+ * A simple driver for SolarFlare NICs to send and receive unreliable datagrams. 
+ * This driver does not provide any reliability guarantees and is intended to be
+ * used with higher level transport code (eg. FastTransport).
+ * See `Driver' class for more details.
+ *
+ * Note: This is ZeroCopy version of SolarFlareDriver that requires IO-MMU and
+ * SR-IOV enable on your machines and SolarFlare NIC. Refer to Scalable Pakcet
+ * Mode in Onload Userguide.
+ */
 
 class SolarFlareDriver : public Driver {
   public:
@@ -63,9 +61,8 @@ class SolarFlareDriver : public Driver {
                             const uint32_t headerLen,
                             Buffer::Iterator *payload);
     virtual string getServiceLocator();
-    virtual Driver::Address* newAddress(const ServiceLocator& serviceLocator) {
-        return new SolarFlareAddress(serviceLocator);
-    }
+    virtual Driver::Address* newAddress(const ServiceLocator& serviceLocator);
+    virtual void registerMemory(void* base, size_t bytes);
 
     /**
      * A helper function for finding the maximum possible size (in bytes) of RPC
@@ -103,36 +100,21 @@ class SolarFlareDriver : public Driver {
     /// byte of Ethernet header. We assume the Ethernet frame contains IP header
     /// and UDP header right after Ethernet header and then comes the payload
     /// data.
-    static const uint32_t ETH_DATA_OFFSET =
-        sizeof(EthernetHeader) + sizeof(IpHeader) + sizeof(UdpHeader);
-
-     /**
-     * See docs in the ``Driver'' class.
-     */
-    virtual void registerMemory(void* base, size_t bytes) {
-        int rc =
-            ef_memreg_alloc(&logMemoryReg, driverHandle, &protectionDomain,
-            driverHandle, base, downCast<int>(bytes));
-        if (rc < 0) {
-            DIE("Failed to register memory region at %p and size"
-                " %Zd bytes for SolarFlare NIC", base, bytes);
-        }
-        LOG(NOTICE, "Registered memory at %p and size %Zd bytes to"
-            " SolarFlare NIC", base, bytes);
-        logBase = reinterpret_cast<uintptr_t>(base);
-        logBytes = bytes;
-    }
+    static const uint32_t ETH_DATA_OFFSET = sizeof(NetUtil::EthernetHeader) +
+            sizeof(NetUtil::IpHeader) + sizeof(NetUtil::UdpHeader);
 
     /**
      * Defines a memory buffer that is to be pushed into the RX or TX ring
      * of the SolarFlare adapter for receiving/transmitting packets. Each
-     * PacketBuff must be withing the region of memory that SolarFlare NIC has
-     * DMA access to it.
+     * PacketBuff must be within the region of memory that SolarFlare NIC has
+     * DMA access to. As per SolarFlare documentations, the packet buffers
+     * better be 2KB sized even though the data part is less than 2KB.
+     * The extra space is used to keep few auxiliary fields for efficient
+     * handling of the PacketBuffs. 
      */
      struct PacketBuff {
-        struct PacketBuff* next;
 
-        /// Holds the DMA address to the beginning of the data array
+        /// Holds the DMA address of the beginning of the data array
         /// (dmaBuffer[]) of this buffer.
         ef_addr dmaBufferAddress;
 
@@ -143,39 +125,35 @@ class SolarFlareDriver : public Driver {
 
         /// For every RX packet, this address will be constructed from senders
         /// information and will be passed to the higher level transport code
-        /// (eg. FastTransport). The reply packets will be sent to this address.
-        /// We keep the address object for an RX packet in the excess space
-        /// of this buffer object for efficient use of the extra space.
-        Tub<SolarFlareAddress> solarFlareAddress;
+        /// (eg. FastTransport). This address will be used for sending replies
+        /// back.
+        Tub<MacIpAddress> solarFlareAddress;
 
-        /// The actual packet content in this buffer starts at this address.
-        /// It's cache aligned for performance optimization.
+        /// The packet content starts at this address and it's cache aligned for
+        /// performance optimization. N.B. In the receive path, SolarFlare NIC
+        /// adds some prefix data at this start and the received Ethernet packet
+        /// starts right after the prefix data.
         uint8_t dmaBuffer[0] CACHE_ALIGN;
     };
 
     /**
      * A container for a list (pool) of packet buffers that are registered to
      * the NIC and ready to be pushed to RX or TX ring. Provides methods for
-     * fast accessing PacketBuffs, getting free and ready to use packetBuffs or
-     * retrieving the packets and putting them back into the container after
-     * they are unbundled from RX/TX ring.
+     * accessing PacketBuffs quickly, getting free and ready to use packetBuffs
+     * or putting the PacketBuffs back into the container after they are
+     * unbundled from RX/TX ring.
      */
     class RegisteredBuffs {
       public:
         RegisteredBuffs(int bufferSize, int numBuffers,
             SolarFlareDriver* driver);
-        ~RegisteredBuffs() {
-            free(memoryChunk);
-            ef_memreg_free(&registeredMemRegion, driver->driverHandle);
+        ~RegisteredBuffs();
 
-        }
-
-        void prependToList(PacketBuff* packetBuff);
-        void prependToListById(int packetId);
-        PacketBuff* popFreeBuffer();
         PacketBuff* getBufferById(int packetId);
+        PacketBuff* popFreeBuffer();
 
       PRIVATE:
+        friend class SolarFlareDriver;
 
         /// Address of the first byte of the memory region that is registered to
         /// the NIC for DMA access and has been subdivided into packet buffers
@@ -186,15 +164,16 @@ class SolarFlareDriver : public Driver {
         /// region of memory that is registered to the NIC container.
         ef_memreg registeredMemRegion;
 
-        /// Total size in bytes of each  packet buffer in the list.
+        /// Total size in bytes of each packet buffer in the list.
         int bufferSize;
 
-        /// Total number of buffers in the list.
+        /// Total number of buffers initially registered to NIC in this class
+        /// and placed into the freeBuffersVec.
         int numBuffers;
 
-        /// Address of the first free to use buffer in the list (head of the
-        /// list) that is ready to be pushed to TX or RX ring.
-        PacketBuff* freeBufferList;
+        /// Contains pointers to packet buffers that are free and ready to be
+        /// pushed into TX or RX ring.
+        std::vector<PacketBuff*> freeBuffersVec;
 
         /// Pointer to the driver that owns this object.
         SolarFlareDriver* driver;
@@ -214,7 +193,7 @@ class SolarFlareDriver : public Driver {
     string localStringLocator;
 
     /// Keeps a copy of the address object for this SolarFlareDriver.
-    Tub<SolarFlareAddress> localAddress;
+    Tub<MacIpAddress> localAddress;
 
     /// Handler that is invoked whenever a new packet comes in.
     std::unique_ptr<IncomingPacketHandler> incomingPacketHandler;
@@ -222,27 +201,28 @@ class SolarFlareDriver : public Driver {
     /// Handle to talk to SolarFlare NIC. Needed to allocate resources.
     ef_driver_handle driverHandle;
 
-    /// Determines how memory should be protected for a Virtual Interfaces (VI).
+    /// Determines how memory should be protected for a Virtual Interface (VI).
     /// A protection domain is a collection of VIs and memory regions tied to
     /// single user interface.
     ef_pd protectionDomain;
 
     /// A Handle for the RAMCloud's log memory region that is registered to
     /// SolarFlare NIC. This will contain an array of DMA addresses of each page
-    /// within that log memory region. It will be used for finding DMA addresses
-    /// of memory addresses in that region for zero copy transmission from that
-    /// address. It will be filled out by SolarFlareDriver::registerMemory func.
+    /// within the registered log memory region. This will be used for finding
+    /// DMA addresses of memory addresses in that region for zero copy
+    /// transmission from that address. It will be filled out by
+    /// SolarFlareDriver::registerMemory function.
     ef_memreg logMemoryReg;
 
     /// The address to the beginning of RAMCloud's logMemory that is registered
-    /// to SolarFlare NIC. Along with the logBytes defines the region of
+    /// to SolarFlare NIC. Along with the regMemoryBytes defines the region of
     /// logMemory that SolarFlare NIC has DMA access to it and cad do zero copy
     /// transmission of packets from that region.
-    uintptr_t logBase;
+    uintptr_t regMemoryBase;
 
     /// The length in bytes of the logMemory region that is registered to
     /// SolarFlare NIC for zero copy transmission of packets.
-    size_t logBytes;
+    size_t regMemoryBytes;
 
     /// The Solarflare ef_vi API is a layer 2 API that grants an application
     /// direct (kernel bypassed) access to the Solarflare network adapter
@@ -255,7 +235,7 @@ class SolarFlareDriver : public Driver {
     ef_vi virtualInterface;
 
     /// A container that allocates some number of packet buffers that are
-    /// registered to the NIC and will be used for transmitting packets.
+    /// registered to the NIC and will be used for receiving packets.
     Tub<RegisteredBuffs> rxBufferPool;
 
     /// A container that allocates some number of packet buffers that are
@@ -273,26 +253,21 @@ class SolarFlareDriver : public Driver {
     /// must have been released and therefore this variable must be zero.
     uint64_t buffsNotReleased;
 
-    /// The number of packets for which we have called init() since the last
-    /// time we called push(). In other words this is the number of packets
-    /// that are prepared to be pushed to RX ring however not yet
-    /// pushed as we want to push the in batch size of RX_REFILL_BATCH_SIZE
-    /// for performance efficiency.
-    uint64_t rxPktsReadyToPush;
+    /// Tracks the total number of packet buffers currently living on the
+    /// RX ring plus the packets that are initialized but they have not yet been
+    /// pushed to the RX ring.
+    int rxRingFillLevel;
 
-    /// Tracks the difference between RX_RING_CAP and sum current fill level of
-    /// the RX ring and number of RX buffers that are initialized by init()
-    /// function but not yet pushed to the RX ring.
-    int numRxPktsToPost;
-
-    /// This file descriptor is only necessary when this driver is being used on
-    /// a client side and no locator string has been provided.
+    /// A socket descriptor for allocating a free port number from the kernel
+    /// for this driver. This is only necessary when this driver is being
+    /// used on a client side and no locator string has been provided for the
+    /// driver in the construction time.
     int fd;
 
-    int refillRxRing(int numPktToPost);
+    void refillRxRing();
     void handleReceived(int packetId, int packetLen);
-    const string rxDiscardTypeToStr(int type);
-    const string txErrTypeToStr(int type);
+    const char* rxDiscardTypeToStr(int type);
+    const char* txErrTypeToStr(int type);
 
     /**
      * This is the object that polls the notifications from the event
