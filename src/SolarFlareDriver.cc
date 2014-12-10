@@ -66,54 +66,48 @@ SolarFlareDriver::SolarFlareDriver(Context* context,
     , rxPktsReadyToPush(0)
     , numRxPktsToPost(0)
     , fd(-1)
-    , sockAddr()
     , poller()
 {
     if (localServiceLocator == NULL) {
+
+        // socket address for the file descriptor fd.
+        sockaddr sockAddr;
         string localIpStr =  getLocalIp("eth0");
         sockaddr_in *sockInAddr = reinterpret_cast<sockaddr_in*>(&sockAddr);
         sockInAddr->sin_family = AF_INET;
         inet_aton(localIpStr.c_str(), &sockInAddr->sin_addr);
 
-        // Let the kernel choose a port when we create the socket
+        // Let the kernel choose a port when we bind the socket
         sockInAddr->sin_port = HTONS(0);
         fd = sys->socket(AF_INET, SOCK_STREAM, 0);
         if (fd < 0) {
             throw Exception(HERE, "Could not create socket for"
                 " SolarFlareDrvier", errno);
         }
-        
+
         int r = sys->bind(fd, &sockAddr, sizeof(sockAddr));
         if (r < 0) {
             sys->close(fd);
             string msg =
                 format("SolarFlareDriver could not bind the socket to %s",
                 inet_ntoa(sockInAddr->sin_addr));
-            LOG(WARNING,"%s", msg.c_str());
+            LOG(WARNING, "%s", msg.c_str());
             throw Exception(HERE, msg.c_str(), errno);
         }
 
-        int optval = 1;
-        r = 
-            sys->setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &optval,
-            sizeof(optval));
-        if (r != 0) {
+        socklen_t addrLen = sizeof(sockAddr);
+        r = sys->getsockname(fd, &sockAddr, &addrLen);
+        if (!NTOHS(sockInAddr->sin_port)) {
             sys->close(fd);
-            string msg = 
-                format("SolarFlareDriver couldn't set SO_REUSEADDR on "
-                "listen socket: %s", strerror(errno));
+            string msg =
+                format("Kernel binds SolarFlare socket to port 0."
+                " Not acceptable!");
             LOG(WARNING, "%s", msg.c_str());
-            throw TransportException(HERE,
-                    "SolarFlareDriver couldn't set SO_REUSEADDR on listen socket",
-                    errno);
+            throw Exception(HERE, msg.c_str(), errno);
         }
-
-        socklen_t sockAddrLen;
-        sys->getsockname(fd, &sockAddr, &sockAddrLen);
-
         // If localServiceLocator is NULL, we have to make a locatorString for
         // this driver. We use the actual MAC and IP address of this machine
-        // along with a randomly generated number for port.
+        // along with a port number that we kernel returned to us above.
         std::stringstream locatorStream;
         locatorStream << "fast+sf:mac=" << getLocalMac("eth0").c_str() << ",";
         locatorStream << "host=" << localIpStr.c_str() << ",";
@@ -125,6 +119,7 @@ SolarFlareDriver::SolarFlareDriver(Context* context,
             "Created the locator string: %s"
             , localStringLocator.c_str());
         localAddress.construct(sl);
+
     } else if (!localServiceLocator->getOption<const char*>("mac", NULL)) {
         std::stringstream macStream;
         macStream << ",mac=" << getLocalMac("eth0").c_str();
@@ -187,11 +182,11 @@ SolarFlareDriver::SolarFlareDriver(Context* context,
     // 32 large RPC size worth of packets to be allocated for receiving packets.
     // Might not be enough if 32 different clients try to read large RPCs from
     // a single server.
-    int numRxBuffers = getMaxRpcLen() * 32 / ADAPTER_BUFFER_SIZE;  
+    int numRxBuffers = getMaxRpcLen() * 32 / ADAPTER_BUFFER_SIZE;
     int rxBufferSize = ADAPTER_BUFFER_SIZE;
     rxBufferPool.construct(rxBufferSize, numRxBuffers, this);
     refillRxRing(RX_RING_CAP);
-    
+
     int txBufferSize = ADAPTER_BUFFER_SIZE;
     int numTxBuffers = TX_RING_CAP;
     txBufferPool.construct(txBufferSize, numTxBuffers, this);
@@ -199,7 +194,7 @@ SolarFlareDriver::SolarFlareDriver(Context* context,
 }
 
 /**
- * Constructor for RegisteredBuffs object. *
+ * Constructor for RegisteredBuffs object:
  * \param bufferSize
  *      Size of each packet buffer in the freeBufferList.
  * \param numBuffers
@@ -212,7 +207,7 @@ SolarFlareDriver::RegisteredBuffs::RegisteredBuffs(int bufferSize,
     int numBuffers, SolarFlareDriver* driver)
     : memoryChunk()
     , registeredMemRegion()
-    , bufferSize(bufferSize) 
+    , bufferSize(bufferSize)
     , numBuffers(numBuffers)
     , freeBufferList()
     , driver(driver)
@@ -225,7 +220,7 @@ SolarFlareDriver::RegisteredBuffs::RegisteredBuffs(int bufferSize,
     }
 
     // Register the memory chunk to NIC.
-    int rc = 
+    int rc =
         ef_memreg_alloc(&registeredMemRegion, driver->driverHandle,
         &driver->protectionDomain, driver->driverHandle,
         memoryChunk, totalBytes);
@@ -233,7 +228,7 @@ SolarFlareDriver::RegisteredBuffs::RegisteredBuffs(int bufferSize,
         DIE("Failed to allocate a registered memory region in SolarFlare NIC"
         " for transmit packet buffers!");
     }
-    
+
     // Divides the chunk into PacketBuffs and link them into a list.
     struct PacketBuff* head = NULL;
     for (int i = 0; i < numBuffers; i++) {
@@ -265,7 +260,7 @@ SolarFlareDriver::PacketBuff*
 SolarFlareDriver::RegisteredBuffs::getBufferById(int packetId)
 {
     assert(packetId < numBuffers);
-    return reinterpret_cast<struct PacketBuff*>( memoryChunk 
+    return reinterpret_cast<struct PacketBuff*>(memoryChunk
         + packetId * bufferSize);
 }
 
@@ -392,9 +387,9 @@ SolarFlareDriver::~SolarFlareDriver() {
     if (fd < 0) {
         sys->close(fd);
     }
-} 
+}
 
-// See docs in the ``Driver'' class.
+/// See docs in the ``Driver'' class.
 void
 SolarFlareDriver::connect(IncomingPacketHandler* incomingPacketHandler)
 {
@@ -402,7 +397,7 @@ SolarFlareDriver::connect(IncomingPacketHandler* incomingPacketHandler)
     poller.construct(context, this);
 }
 
-// See docs in the ``Driver'' class.
+/// See docs in the ``Driver'' class.
 void
 SolarFlareDriver::disconnect()
 {
@@ -410,7 +405,7 @@ SolarFlareDriver::disconnect()
     this->incomingPacketHandler.reset();
 }
 
-// See docs in the ``Driver'' class.
+/// See docs in the ``Driver'' class.
 uint32_t
 SolarFlareDriver::getMaxPacketSize()
 {
@@ -418,7 +413,7 @@ SolarFlareDriver::getMaxPacketSize()
            downCast<uint32_t>(sizeof(IpHeader) + sizeof(UdpHeader));
 }
 
-// See docs in the ``Driver'' class.
+/// See docs in the ``Driver'' class.
 void
 SolarFlareDriver::release(char* payload)
 {
@@ -434,7 +429,7 @@ SolarFlareDriver::release(char* payload)
     rxBufferPool->prependToList(packetBuff);
 }
 
-// See docs in the ``Driver'' class.
+/// See docs in the ``Driver'' class.
 void
 SolarFlareDriver::sendPacket(const Driver::Address* recipient,
                              const void* header,
@@ -457,7 +452,7 @@ SolarFlareDriver::sendPacket(const Driver::Address* recipient,
     // registered log memory region.
     uint32_t maxIovecs = 2 + (payload ? payload->getNumberChunks() : 0);
     ef_iovec iovec[maxIovecs];
-    
+
     // The actual number of the iovecs that we will use.
     int numIovecs = 0;
 
@@ -472,7 +467,7 @@ SolarFlareDriver::sendPacket(const Driver::Address* recipient,
             " get free buffers");
         context->dispatch->poll();
     }
-    
+
     // Fill Ethernet header except recipient's mac address
     EthernetHeader* ethHdr = new(txRegisteredBuf->dmaBuffer) EthernetHeader;
     memcpy(ethHdr->srcAddress, localAddress->macAddress->address,
@@ -510,7 +505,7 @@ SolarFlareDriver::sendPacket(const Driver::Address* recipient,
         sizeof(EthernetHeader) + sizeof(IpHeader) + sizeof(UdpHeader)
     };
 
-    uint8_t* txBufferTail = 
+    uint8_t* txBufferTail =
         reinterpret_cast<uint8_t*>(udpHdr) + sizeof(UdpHeader);
 
     // If header is in the log memory that NIC has DMA access to, we don't
@@ -534,17 +529,17 @@ SolarFlareDriver::sendPacket(const Driver::Address* recipient,
     }
 
     // Ship the payload in iovecs here
-    uint8_t* txBufferLead = txBufferTail;   
+    uint8_t* txBufferLead = txBufferTail;
     while (payload && !payload->isDone()) {
         const uintptr_t payloadAddr =
             reinterpret_cast<const uintptr_t>(payload->getData());
 
-        if (payloadAddr >= logBase && 
+        if (payloadAddr >= logBase &&
             (payloadAddr + payload->getLength()) < (logBase + logBytes)) {
 
             if (txBufferLead != txBufferTail) {
                 iovec[numIovecs++] = {
-                    txRegisteredBuf->dmaBufferAddress + 
+                    txRegisteredBuf->dmaBufferAddress +
                         (txBufferLead - txRegisteredBuf->dmaBuffer),
                     downCast<unsigned int>(txBufferTail - txBufferLead)
                 };
@@ -552,7 +547,7 @@ SolarFlareDriver::sendPacket(const Driver::Address* recipient,
             }
 
             iovec[numIovecs++] = {
-                ef_memreg_dma_addr(&logMemoryReg, 
+                ef_memreg_dma_addr(&logMemoryReg,
                     downCast<int>(payloadAddr - logBase)),
                 payload->getLength()
             };
@@ -562,16 +557,22 @@ SolarFlareDriver::sendPacket(const Driver::Address* recipient,
         }
         payload->next();
     }
-    
+
     if (txBufferLead != txBufferTail) {
         iovec[numIovecs++] = {
-            txRegisteredBuf->dmaBufferAddress + 
+            txRegisteredBuf->dmaBufferAddress +
                 (txBufferLead - txRegisteredBuf->dmaBuffer),
             downCast<unsigned int>(txBufferTail - txBufferLead)
         };
         txBufferLead = txBufferTail;
     }
-
+#if TESTING
+    TEST_LOG("Total number of IoVecs are %d", numIovecs);
+    for (int i = 0; i < numIovecs; i++) {
+        TEST_LOG("IoVec %d starting at %lu and size %u", i,
+            iovec[i].iov_base, iovec[i].iov_len);
+    }
+#endif
     // Resolve recipient mac address
     const uint8_t *recvMac = recipientAddress->macAddress->address;
     if (!recipientAddress->macProvided) {
@@ -598,7 +599,7 @@ SolarFlareDriver::sendPacket(const Driver::Address* recipient,
             txBufferPool->prependToList(txRegisteredBuf);
             in_addr destInAddr = {ipHdr->ipDestAddress};
             LOG(WARNING, "Was not able to resolve the MAC address for the"
-                " destined to %s", inet_ntoa(destInAddr));
+                " packet destined to %s", inet_ntoa(destInAddr));
         }
     } else {
         memcpy(ethHdr->destAddress, recvMac, sizeof(ethHdr->destAddress));
@@ -738,10 +739,9 @@ SolarFlareDriver::handleReceived(int packetId, int packetLen)
     assert(downCast<uint32_t>(packetLen) >=
                         rxPrefixLen + sizeof(EthernetHeader) +
                         sizeof(IpHeader) + sizeof(UdpHeader));
-    assert(downCast<uint32_t>(packetLen) < ETHERNET_MAX_DATA_LEN);
 
+    assert(downCast<uint32_t>(packetLen) < ETHERNET_MAX_DATA_LEN);
     struct PacketBuff* packetBuff = rxBufferPool->getBufferById(packetId);
-        
     char* ethPkt = reinterpret_cast<char*>(packetBuff->dmaBuffer) + rxPrefixLen;
     uint32_t totalLen = packetLen - rxPrefixLen;
     EthernetHeader* ethHdr = reinterpret_cast<EthernetHeader*>(ethPkt);
@@ -762,9 +762,9 @@ SolarFlareDriver::handleReceived(int packetId, int packetLen)
     uint32_t ip = ntohl(ipHdr->ipSrcAddress);
     uint16_t port = NTOHS(udpHdr->srcPort);
 
-    Received received; 
+    Received received;
     received.payload =  ethPkt + ETH_DATA_OFFSET;
-    received.len = 
+    received.len =
         downCast<uint32_t>(NTOHS(udpHdr->totalLength) -
         downCast<uint16_t>(sizeof(UdpHeader)));
     received.driver = this;
