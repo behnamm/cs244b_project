@@ -72,10 +72,10 @@ SolarFlareDriver::SolarFlareDriver(Context* context,
         localAddress.construct(sl);
     } else if (!localServiceLocator->getOption<const char*>("mac", NULL)) {
         std::stringstream macStream;
-        macStream << ",mac=" << getLocalMac("eth0").c_str(); 
+        macStream << ",mac=" << getLocalMac("eth0").c_str();
         localStringLocator = localServiceLocator->getOriginalString();
         ServiceLocator sl(localStringLocator + macStream.str());
-        localAddress.construct(sl); 
+        localAddress.construct(sl);
     } else {
         localStringLocator = localServiceLocator->getOriginalString();
         localAddress.construct(*localServiceLocator);
@@ -163,7 +163,7 @@ SolarFlareDriver::SolarFlareDriver(Context* context,
     freeTransmitList = initPacketBuffer(transmitMemory,
                                         NUM_TX_BUFS,
                                         &registeredMemory);
-    arpCache.construct(context, this, localIp);
+    arpCache.construct(context, localIp, "eth0");
 }
 
 /**
@@ -363,15 +363,15 @@ SolarFlareDriver::sendPacket(const Driver::Address* recipient,
     }
 
     uint32_t totalLen =  downCast<uint32_t>(sizeof(EthernetHeader) + ipLen);
-    
+
     // Resolve recipient mac address
     const uint8_t *recvMac = recipientAddress->macAddress.address;
     if (recvMac[5] == 0x00 && recvMac[4] == 0x00 && recvMac[3] == 0x00 &&
         recvMac[2] == 0x00 && recvMac[1] == 0x00 && recvMac[0] == 0x00) {
 
-        // No mac has been provided, so we need to resolve it through arp
-        // process.
-        if (arpCache->arpLookup(toSend->dmaBuffer, "eth0")) {
+        // No mac has been provided, so we need to resolve it through ARP
+        // lookup.
+        if (arpCache->arpLookup(ipHdr->ipDestAddress, ethHdr)) {
 
             // By invoking ef_vi_transmit() the descriptor that describes the
             // packet is queued in the transmit ring, and a doorbell is rung to
@@ -382,18 +382,22 @@ SolarFlareDriver::sendPacket(const Driver::Address* recipient,
                 downCast<int>(totalLen), toSend->id);
         } else {
 
-            // Could not resolve mac from the local arp cache or kernel arp
+            // Could not resolve mac from the local ARP cache or kernel arp
             // cache. This probably means we don't have access to kernel arp
-            // cache or kernel arp cache times out pretty quickly.
+            // cache or kernel arp cache times out pretty quickly or the arp
+            // packets takes a long time to travel in network. Any ways, we
+            // return immediately without sending the packet out and let the
+            // higher level transport code to take care of retransmission later.
             toSend->next = freeTransmitList;
             freeTransmitList = toSend;
-            DIE("Can't resolve mac destination address. Either there is no"
-               " no proper access to kernel ARP cache or it times out quick!");
+            in_addr destInAddr = {ipHdr->ipDestAddress};
+            LOG(WARNING, "Was not able to to resolve the MAC address for the"
+                " destined to %s", inet_ntoa(destInAddr));
         }
     } else {
         memcpy(ethHdr->destAddress, recvMac,
            sizeof(ethHdr->destAddress));
-      
+
     //LOG(NOTICE, "%s", (ethernetHeaderToStr(ethHdr)).c_str());
     //LOG(NOTICE, "%s", (ipHeaderToStr(ipHdr)).c_str());
     //LOG(NOTICE, "%s", (udpHeaderToStr(udpHdr)).c_str());

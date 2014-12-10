@@ -88,6 +88,7 @@ const string getLocalIp(const char* ifName);
 const string ethernetHeaderToStr(const void* ethHeader);
 const string ipHeaderToStr(const void* ipHeader);
 const string udpHeaderToStr(const void* udpHeader);
+const string macToStr(const uint8_t* mac);
 
 } //namespace EthernetUtil
 

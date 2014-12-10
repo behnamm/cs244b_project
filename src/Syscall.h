@@ -22,6 +22,7 @@
 #include <sys/syscall.h>
 #include <netinet/in.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>
 #include <cstdio>
 
 #include "Common.h"
@@ -76,6 +77,10 @@ class Syscall {
     VIRTUAL_FOR_TESTING
     void exit(int status) {
         ::exit(status);
+    }
+    VIRTUAL_FOR_TESTING
+    int ioctl(int fd, int reqType, void* request) {
+        return ::ioctl(fd, reqType, request);
     }
     VIRTUAL_FOR_TESTING
     int fcntl(int fd, int cmd, int arg1) {

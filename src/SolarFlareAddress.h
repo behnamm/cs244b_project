@@ -31,7 +31,7 @@ namespace RAMCloud {
 class SolarFlareAddress : public Driver::Address {
   public:
     explicit SolarFlareAddress(const ServiceLocator& serviceLocator);
-    explicit SolarFlareAddress(const uint8_t mac[6], 
+    explicit SolarFlareAddress(const uint8_t mac[6],
                                const uint32_t ip,
                                const uint16_t port);
 

@@ -19,6 +19,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <fcntl.h>
+#include <sys/ioctl.h>
 
 #include "Common.h"
 #include "Syscall.h"
@@ -37,7 +38,7 @@ class MockSyscall : public Syscall {
                     epollWaitCount(-1), epollWaitEvents(NULL),
                     epollWaitErrno(0), exitCount(0),
                     fcntlErrno(0), futexWaitErrno(0), futexWakeErrno(0),
-                    fwriteResult(~0LU), listenErrno(0),
+                    fwriteResult(~0LU), ioctlErrno(0), listenErrno(0),
                     pipeErrno(0), recvErrno(0), recvEof(false),
                     recvfromErrno(0), recvfromEof(false),
                     sendmsgErrno(0), sendmsgReturnCount(-1),
@@ -164,6 +165,15 @@ class MockSyscall : public Syscall {
         size_t result = fwriteResult;
         fwriteResult = ~0LU;
         return result;
+    }
+
+    int ioctlErrno;
+    int ioctl(int fd, int reqType, void* request) {
+        if (ioctlErrno == 0) {
+            return ::ioctl(fd, reqType, request);
+        }
+        errno = ioctlErrno;
+        return -1;
     }
 
     int listenErrno;

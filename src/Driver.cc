@@ -33,10 +33,6 @@ Driver::release(char *payload)
 {
 }
 
-void
-Driver::sendEthPacket(const uint8_t* ethPkt, const uint32_t pktLen)
-{
-}
 /// Construct a received containing no data and unassociated with a Driver.
 Driver::Received::Received()
     :  sender(NULL)

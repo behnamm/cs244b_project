@@ -162,7 +162,6 @@ ethernetHeaderToStr(const void* ethHeader)
  * \return
  *      The contents of the IP header in a formatted string.
  */
-
 const string
 ipHeaderToStr(const void* ipHeader)
 {
@@ -207,6 +206,24 @@ udpHeaderToStr(const void* udpHeader)
                   NTOHS(udpHdr->srcPort), NTOHS(udpHdr->destPort),
                   NTOHS(udpHdr->totalLength), NTOHS(udpHdr->totalChecksum));
 }
+
+/**
+ * This method recieves a pointer to a mac address in byte array format (6 bytes
+ * standard mac address) and formats it to a string of colon delimited numbers
+ * in hex base (XX:XX:XX:XX:XX:XX).
+ *
+ * \param mac
+ *      Pointer to the byte array mac address.
+ * \return
+ *      A string containing the mac address in XX:XX:XX:XX:XX:XX format.
+ */
+const string
+macToStr(const uint8_t* mac)
+{
+    return format("%02X:%02X:%02X:%02X:%02X:%02X", mac[0], mac[1], mac[2],
+        mac[3], mac[4], mac[5]);
+}
+
 
 } //namespace EthernetUtil
 } //namespcae RAMCloud

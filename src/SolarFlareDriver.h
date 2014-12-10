@@ -42,7 +42,7 @@ using namespace EthernetUtil; //NOLINT
 * See Driver.h for some more details.
 */
 
-// This makes a macro for compiler cache aligning to the cash line size.
+// This macro force the compiler align addresses to the cash line size.
 // This is necessary as a perfomance boost for the data portion of packet
 // buffers.
 #define CACHE_ALIGN  __attribute__((aligned(CACHE_LINE_SIZE)))
