@@ -80,6 +80,7 @@ class FastTransport : public Transport {
     class Session;
     class ServerSession;
     class ClientSession;
+    class OutboundMessage;
   public:
     explicit FastTransport(Context* context, Driver* driver);
     ~FastTransport();
@@ -90,10 +91,8 @@ class FastTransport : public Transport {
     VIRTUAL_FOR_TESTING void handleIncomingPacket(Driver::Received *received);
 
     string getServiceLocator();
-    void registerMemory(void* base, size_t bytes) {
-        driver->registerMemory(base, bytes);
-    }
-
+    void registerMemory(void* base, size_t bytes) {}
+    // string payloadtype;
     /**
      * Manages an entire request/response cycle from the client perspective.
      *
@@ -155,6 +154,26 @@ class FastTransport : public Transport {
         friend class FastTransport;
         DISALLOW_COPY_AND_ASSIGN(ServerRpc);
     };
+
+    class PfabricScheduler: Dispatch::Poller {
+    private:
+      std::vector<OutboundMessage*> activeOutboundMsgs;
+
+    public:
+      explicit PfabricScheduler(Context* context);
+      ~PfabricScheduler();
+      void poll();
+      void addToActiveVector(OutboundMessage *msg);
+      void removeFromActiveVector(OutboundMessage *msg);
+      size_t findMin(std::vector<OutboundMessage*> activeOutboundMsgs);
+      uint64_t numTokens;
+      uint64_t rateLimit;
+      uint64_t maxTokens;
+      uint64_t lastTimeCalled;    
+    };
+
+
+    PfabricScheduler pfabricObj;
 
   PRIVATE:
     /**
@@ -230,16 +249,20 @@ class FastTransport : public Transport {
         Header()
             : sessionToken(0)
             , rpcId(0)
+	// ,seqNumber(0)
             , clientSessionHint(0)
             , serverSessionHint(0)
-            , fragNumber(0)
+	// ,seqNumber(0)
+	    , fragNumber(0)
             , totalFrags(0)
+	// ,isProcessed(0)
             , channelId(0)
             , direction(CLIENT_TO_SERVER)
             , requestAck(0)
             , pleaseDrop(0)
             , reserved1(0)
             , payloadType(DATA)
+            
         {
         }
 
@@ -254,7 +277,8 @@ class FastTransport : public Transport {
             BAD_SESSION  = 4,   ///< Payload invalid, requested session bad.
             RESERVED2    = 5,
             RESERVED3    = 6,
-            RESERVED4    = 7
+            RESERVED4    = 7,
+            KEEP_ALIVE   = 8
         };
 
         /// Values for direction field.
@@ -275,7 +299,7 @@ class FastTransport : public Transport {
          * sessionToken and channelId) which rpc this fragment is a part of.
          */
         uint32_t rpcId;
-
+      // int seqNumber;
         /**
          * Offset into clientSessionTable of the ClientSession of this rpc.
          * Used for fast fragment to session association.  This must be
@@ -378,6 +402,8 @@ class FastTransport : public Transport {
         }
     } __attribute__((packed));
 
+    // Header *pFabricHeader;
+
     /**
      * Wire-format for response with PayloadType SESSION_OPEN.
      */
@@ -447,6 +473,8 @@ class FastTransport : public Transport {
         void reset();
         void init(uint16_t totalFrags, Buffer* dataBuffer);
         bool processReceivedData(Driver::Received* received);
+	void resetSilentIntervals();
+	//	void processReceivedKeepAlive();
       PRIVATE:
         /// The transport to which this message belongs.  Set by setup().
         FastTransport* transport;
@@ -546,8 +574,19 @@ class FastTransport : public Transport {
                    uint32_t channelId, bool useTimer);
         void reset();
         void beginSending(Buffer* dataBuffer);
-        void send();
+        uint64_t  send(uint64_t numTokens);
+	void send();
+	void sendKeepAlive();
         bool processReceivedAck(Driver::Received* received);
+	bool isActive;
+	uint32_t nextFragToSend;
+	uint32_t stopCallSend;
+	uint64_t bytesSent;
+        uint64_t lastTimeSent;
+	uint32_t getFirstMissingFrag();
+	uint32_t getTotalFrags();
+       
+	//	uint32_t firstFragToSend; 
 
       PRIVATE:
         void sendOneData(uint32_t fragNumber, bool forceRequestAck = false);
@@ -560,6 +599,7 @@ class FastTransport : public Transport {
 
         /// ID of the Channel this message is associated with.
         uint32_t channelId;
+	//	int seqNum;
 
         /// The data this message is sending.
         Buffer* sendBuffer;
@@ -572,7 +612,12 @@ class FastTransport : public Transport {
 
         /// The total number of fragments in the message to send.
         uint32_t totalFrags;
+	//	bool isProcessed;
+	//next fragment that should be sent
+	//	uint32_t nextFragToSend;
 
+	//stop call send() 
+	//uint32_t stopCallSend;
         /**
          * The number of data packets sent on the wire since the last ACK
          * request. This is used to determine when to request the next ACK.
@@ -857,6 +902,7 @@ class FastTransport : public Transport {
 
             /// The RPC response is managed here.
             OutboundMessage outboundMsg;
+	  // std::vector<OutboundMessage*> outboundMsgVector; 
 
             /**
              * Disambiguates fragments on subsequent rpcs to the same session
@@ -886,6 +932,9 @@ class FastTransport : public Transport {
                                 Driver::Received* received);
         void processReceivedData(ServerChannel* channel,
                                  Driver::Received* received);
+	//	void processReceivedKeepAlive(ServerChannel* channel,
+	//                            Driver::Received* received);
+
 
         /**
          * The channels for this session.
@@ -994,6 +1043,8 @@ class FastTransport : public Transport {
 
             /// The RPC response is managed here.
             OutboundMessage outboundMsg;
+	    // std::vector<OutboundMessage*> outboundMsgVector;
+
 
             /**
              * The rpcId of the active RPC.
@@ -1075,6 +1126,8 @@ class FastTransport : public Transport {
                                 Driver::Received* received);
         void processReceivedData(ClientChannel* channel,
                                  Driver::Received* received);
+	void processReceivedKeepAlive(ClientChannel* channel,
+				      Driver::Received* received);
         void processSessionOpenResponse(Driver::Received* received);
         void reassignChannel(ClientChannel* channel);
 
@@ -1248,6 +1301,7 @@ class FastTransport : public Transport {
         DISALLOW_COPY_AND_ASSIGN(SessionTable);
     };
 
+  
     uint32_t dataPerFragment();
     uint32_t numFrags(const Buffer* dataBuffer);
     void sendBadSessionError(Header *header, const Driver::Address* address);
@@ -1266,6 +1320,9 @@ class FastTransport : public Transport {
     /// Contains state for all RPCs this transport participates in as server.
     SessionTable<ServerSession> serverSessions;
 
+    // std::vector<OutboundMessage*> *outboundMsgMightBeSent;
+
+
     /// Pool allocator for our ServerRpc objects.
     ServerRpcPool<ServerRpc> serverRpcPool;
 
@@ -1279,6 +1336,8 @@ class FastTransport : public Transport {
     friend class Services;
     friend class Poller;
     DISALLOW_COPY_AND_ASSIGN(FastTransport);
+ 
+    
 };
 
 }  // namespace RAMCloud

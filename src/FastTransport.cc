@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2014 Stanford University
+/* Copyright (c) 2010-2012 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any purpose
  * with or without fee is hereby granted, provided that the above copyright
@@ -14,11 +14,11 @@
  */
 
 #include "FastTransport.h"
-
+#include <inttypes.h>
 #include "ShortMacros.h"
 #include "Cycles.h"
 #include "ServiceManager.h"
-
+#include <sys/time.h>
 namespace RAMCloud {
 
 // --- FastTransport ---
@@ -37,7 +37,8 @@ namespace RAMCloud {
  *      driver and will delete it in the destructor.
  */
 FastTransport::FastTransport(Context* context, Driver* driver)
-    : context(context)
+  :pfabricObj(context) 
+    , context(context)
     , driver(driver)
     , clientSessions(this)
     , serverSessions(this)
@@ -52,6 +53,7 @@ FastTransport::FastTransport(Context* context, Driver* driver)
         FastTransport& t;
     };
     driver->connect(new IncomingPacketHandler(*this));
+    // PfabricScheduler* pfabricObj=new PfabricScheduler(context);
 }
 
 FastTransport::~FastTransport()
@@ -72,6 +74,7 @@ FastTransport::~FastTransport()
 string
 FastTransport::getServiceLocator()
 {
+  
     return driver->getServiceLocator();
 }
 
@@ -80,6 +83,7 @@ Transport::SessionRef
 FastTransport::getSession(const ServiceLocator& serviceLocator,
         uint32_t timeoutMs)
 {
+  
     Dispatch::Lock lock(context->dispatch);
     clientSessions.expire();
     ClientSession* session = clientSessions.get();
@@ -99,6 +103,7 @@ uint64_t FastTransport::sessionExpireCyclesOverride = 0;
 uint32_t
 FastTransport::dataPerFragment()
 {
+  
     return driver->getMaxPacketSize() - sizeof32(Header);
 }
 
@@ -114,7 +119,8 @@ FastTransport::dataPerFragment()
 uint32_t
 FastTransport::numFrags(const Buffer* dataBuffer)
 {
-    uint32_t perFragment = dataPerFragment();
+      
+uint32_t perFragment = dataPerFragment();
     return (dataBuffer->size() + perFragment - 1) /
             perFragment;
 }
@@ -158,6 +164,8 @@ FastTransport::sendPacket(const Driver::Address* address,
     header->pleaseDrop = ((generateRandom() % 100) + 1 <
                           PACKET_LOSS_PERCENTAGE + 1);
 #endif
+       // header->pleaseDrop = ((generateRandom() % 1000) == 0);
+
     driver->sendPacket(address, header, sizeof(*header), payload);
 }
 
@@ -174,7 +182,7 @@ FastTransport::sendPacket(const Driver::Address* address,
  *      if we need to retain it after this method returns.
  */
 void FastTransport::handleIncomingPacket(Driver::Received* received)
-{
+{    
     Header* header = received->getOffset<Header>(0);
     if (header == NULL) {
         LOG(WARNING,
@@ -188,6 +196,7 @@ void FastTransport::handleIncomingPacket(Driver::Received* received)
     }
 
     if (header->getDirection() == Header::CLIENT_TO_SERVER) {
+      
         // Packet is from the client being processed on the server; find
         // an existing session or open a new one.
         if (header->serverSessionHint >= serverSessions.size()) {
@@ -196,6 +205,7 @@ void FastTransport::handleIncomingPacket(Driver::Received* received)
                 LOG(DEBUG, "opening session %d from %s",
                         header->clientSessionHint,
                         received->sender->toString().c_str());
+		//		LOG(NOTICE,"session token: 0x%lx",session->getToken());
                 serverSessions.expire();
                 ServerSession* session = serverSessions.get();
                 session->startSession(received->sender,
@@ -213,6 +223,7 @@ void FastTransport::handleIncomingPacket(Driver::Received* received)
             session->processInboundPacket(received);
             return;
         } else {
+	  LOG(NOTICE,"payload type:%u",header->getPayloadType());
             LOG(WARNING, "bad session token (0x%lx in session %d, "
                 "0x%lx in packet)", session->getToken(),
                 header->serverSessionHint, header->sessionToken);
@@ -229,6 +240,8 @@ void FastTransport::handleIncomingPacket(Driver::Received* received)
                 header->getPayloadType() == Header::SESSION_OPEN) {
                 session->processInboundPacket(received);
             } else {
+	      LOG(NOTICE,"payload type:%u",header->getPayloadType());
+
                 LOG(WARNING, "bad fragment token (0x%lx in session %d, "
                     "0x%lx in packet), client dropping", session->getToken(),
                     header->clientSessionHint, header->sessionToken);
@@ -248,7 +261,7 @@ void FastTransport::handleIncomingPacket(Driver::Received* received)
  *
  * \param session
  *      The ClientSession this RPC is to be emitted on.
- * \param request
+ * \param requestclienrsession
  *      The request payload including RPC headers.
  * \param[out] response
  *      The response payload including the RPC headers.
@@ -428,7 +441,7 @@ FastTransport::InboundMessage::reset()
     firstMissingFrag = 0;
     dataBuffer = NULL;
     timer->stop();
-    silentIntervals = 0;
+    silentIntervals = 0;  
 }
 
 /**
@@ -451,7 +464,7 @@ FastTransport::InboundMessage::init(uint16_t totalFrags,
     this->dataBuffer = dataBuffer;
     if (useTimer) {
         timer->start(transport->context->dispatch->currentTime +
-                session->timeoutCycles);
+		     session->timeoutCycles);
     }
 }
 
@@ -468,9 +481,11 @@ FastTransport::InboundMessage::init(uint16_t totalFrags,
 bool
 FastTransport::InboundMessage::processReceivedData(Driver::Received* received)
 {
+  
     silentIntervals = 0;
     assert(received->len >= sizeof(Header));
     Header *header = reinterpret_cast<Header*>(received->payload);
+    
     if (header->totalFrags != totalFrags) {
         // If the fragment header disagrees on the total length of the message
         // with the value set on init() the packet is ignored.
@@ -542,8 +557,8 @@ FastTransport::InboundMessage::processReceivedData(Driver::Received* received)
                     header->fragNumber);
             }
         }
-    } else { // header->fragNumber < firstMissingFrag
-        // stale, no-op
+    } else { // header->fragNumber < firstMissingFrag      
+  // stale, no-op
     }
 
     if (header->requestAck)
@@ -551,6 +566,22 @@ FastTransport::InboundMessage::processReceivedData(Driver::Received* received)
 
     return firstMissingFrag == totalFrags;
 }
+
+
+  // return silent intervals
+void
+FastTransport::InboundMessage::resetSilentIntervals(){
+  silentIntervals=0;
+}
+
+
+
+  //process received keep alive packet
+/*void
+FastTransport::InboundMessage::processReceivedKeepAlive()
+{
+  silentIntervals=0;
+  }*/
 
 // --- InboundMessage::Timer ---
 
@@ -577,17 +608,16 @@ FastTransport::InboundMessage::Timer::Timer(InboundMessage* const inboundMsg)
 void
 FastTransport::InboundMessage::Timer::handleTimerEvent()
 {
-    inboundMsg->silentIntervals++;
+   inboundMsg->silentIntervals++;
     if (inboundMsg->silentIntervals > MAX_SILENT_INTERVALS) {
         LOG(WARNING, "timeout waiting for response from server at %s",
-            inboundMsg->session->getServiceLocator().c_str());
+                inboundMsg->session->getServiceLocator().c_str());
         inboundMsg->session->abort();
     } else {
         // Note: silentIntervals == 1 isn't cause for concern, since we could
         // have received the latest packet just before this timer fired.
-        if (inboundMsg->silentIntervals > 1) {
+        if (inboundMsg->silentIntervals > 1)
             inboundMsg->sendAck();
-        }
         start(inboundMsg->transport->context->dispatch->currentTime +
               inboundMsg->session->timeoutCycles);
     }
@@ -602,7 +632,12 @@ FastTransport::InboundMessage::Timer::handleTimerEvent()
  * is not ready to send fragments.
  */
 FastTransport::OutboundMessage::OutboundMessage()
-    : transport(NULL)
+    : isActive(0)
+    , nextFragToSend(0)
+    , stopCallSend(0)
+    , bytesSent(0)
+    , lastTimeSent(0)
+    , transport(NULL)
     , session(NULL)
     , channelId(0)
     , sendBuffer(0)
@@ -664,11 +699,14 @@ FastTransport::OutboundMessage::reset()
     sendBuffer = NULL;
     firstMissingFrag = 0;
     totalFrags = 0;
+    nextFragToSend=0;
+    stopCallSend=0;
     packetsSinceAckReq = 0;
     sentTimes.reset();
     silentIntervals = 0;
     numAcked = 0;
     timer->stop();
+    transport->pfabricObj.removeFromActiveVector(this);
 }
 
 /**
@@ -682,11 +720,17 @@ FastTransport::OutboundMessage::reset()
 void
 FastTransport::OutboundMessage::beginSending(Buffer* dataBuffer)
 {
+  
     assert(!sendBuffer);
     sendBuffer = dataBuffer;
     totalFrags = transport->numFrags(sendBuffer);
     silentIntervals = 0;
-    send();
+ 
+    nextFragToSend=firstMissingFrag;
+    transport->pfabricObj.addToActiveVector(this);
+    transport->pfabricObj.poll();
+     
+    //send();
 }
 
 /**
@@ -699,9 +743,11 @@ FastTransport::OutboundMessage::beginSending(Buffer* dataBuffer)
  * Pre-conditions:
  *  - beginSending() must have been called since the last call to reset().
  */
-void
-FastTransport::OutboundMessage::send()
+uint64_t
+FastTransport::OutboundMessage::send(uint64_t numTokens)
 {
+  // i++;
+  // LOG(NOTICE,"num of tokens: %"PRIu32,numTokens);
     /*
      * If a packet is retransmitted due to a timeout it is sent with a request
      * for ACK and no further packets are transmitted until the next event
@@ -710,11 +756,12 @@ FastTransport::OutboundMessage::send()
      * the window allows with every REQ_ACK_AFTER th packet marked as request
      * for ACK.
      *
-     * Side-effects:
+     * Side-effects
      *  - sentTimes is updated to reflect any sent packets.
      *  - If timers are enabled for this message then the timer is scheduled
      *    to fire when the next packet retransmit timeout occurs.
      */
+  // firstFragToSend=firstMissingFrag;
     uint64_t now = Cycles::rdtsc();
 
     // First, decide on candidate range of packets to send/resend
@@ -722,39 +769,45 @@ FastTransport::OutboundMessage::send()
 
     // Can't send beyond the last fragment
     uint32_t stop = totalFrags;
+    
     // Can't send beyond the window
     stop = std::min(stop, numAcked + WINDOW_SIZE);
     // Can't send beyond what the receiver is willing to accept
     stop = std::min(stop, firstMissingFrag + MAX_STAGING_FRAGMENTS + 1);
 
+    stopCallSend=stop;
+    bytesSent=0;
     // Send frags from candidate range
-    for (uint32_t fragNumber = firstMissingFrag; fragNumber < stop;
+    uint32_t fragNumber;
+    for ( fragNumber = nextFragToSend; fragNumber < stop;
             fragNumber++) {
         uint64_t sentTime = sentTimes[fragNumber];
-        // skip if ACKED
-        if (sentTime == ACKED)
+        // skip if ACKED or if already sent but not yet timed out
+        if ((sentTime == ACKED) ||
+            ((sentTime != 0) &&
+             (!useTimer || (sentTime + session->timeoutCycles >= now))))
             continue;
-        // if already sent but not yet timed out, we don't need to
-        // retransmit, so we continue to the next fragment.
-        if (sentTime != 0 && sentTime + session->timeoutCycles >= now)
-            continue;
-
         // isRetransmit if already sent and timed out (guaranteed by if above)
-        bool isRetransmit = sentTime != 0;
+         bool isRetransmit = sentTime != 0;
         // requestAck if retransmit or haven't asked for ack in awhile
-        if (isRetransmit)
-            LOG(DEBUG,
-                "Retransmitting fragNumber %u, token: 0x%lx, channelId: %u"
-                , fragNumber, session->getToken(), channelId);
         bool requestAck = isRetransmit ||
             (packetsSinceAckReq == REQ_ACK_AFTER - 1);
+
+	// can not send byund MaxBytesToSend
+        uint32_t offset = std::min(fragNumber*transport->dataPerFragment(), sendBuffer->size());
+        uint32_t length = std::min(transport->dataPerFragment(), sendBuffer->size() - offset);
+       
+	bytesSent+=length; 
+	if(bytesSent>numTokens){
+	  fragNumber-=1;
+	  bytesSent-=length;
+ 	  break;
+        }
         sendOneData(fragNumber, requestAck);
         sentTimes[fragNumber] = now;
-        if (!useTimer)
-            LOG(DEBUG, "Sending fragNumber %u, on channelId: %u, token: 0x%lx"
-                      , fragNumber, channelId, session->getToken());
-        if (isRetransmit)
-            break;
+        if (isRetransmit){
+             break;
+	}
     }
 
     // If this is the client end of the connection, must perform additional
@@ -781,8 +834,107 @@ FastTransport::OutboundMessage::send()
                 if (sentTime < oldestSentTime)
                     oldestSentTime = sentTime;
         }
+   
+	
         timer->start(oldestSentTime + session->timeoutCycles);
+        
     }
+
+    nextFragToSend=fragNumber+1; 
+    
+
+   return bytesSent;
+}
+
+
+void
+FastTransport::OutboundMessage::send()
+{
+  /*
+   * If a packet is retransmitted due to a timeout it is sent with a request
+   * for ACK and no further packets are transmitted until the next event
+   * (either an additional timeout or an ACK is processed).  If no packet
+   * is retransmitted then the call will send as many fresh data packets as
+   * the window allows with every REQ_ACK_AFTER th packet marked as request
+   * for ACK.
+   *
+   * Side-effects:
+   *  - sentTimes is updated to reflect any sent packets.
+   *  - If timers are enabled for this message then the timer is scheduled
+   *    to fire when the next packet retransmit timeout occurs.
+   */
+  uint64_t now = Cycles::rdtsc();
+
+  // First, decide on candidate range of packets to send/resend
+  // Only fragments less than stop will be considered for (re-)send
+
+  // Can't send beyond the last fragment
+  uint32_t stop = totalFrags;
+  // Can't send beyond the window
+  stop = std::min(stop, numAcked + WINDOW_SIZE);
+  // Can't send beyond what the receiver is willing to accept
+  stop = std::min(stop, firstMissingFrag + MAX_STAGING_FRAGMENTS + 1);
+
+  // Send frags from candidate range
+  for (uint32_t fragNumber = firstMissingFrag; fragNumber < stop;
+       fragNumber++) {
+    uint64_t sentTime = sentTimes[fragNumber];
+    // skip if ACKED or if already sent but not yet timed out
+    if ((sentTime == ACKED) ||
+	((sentTime != 0) &&
+	 (!useTimer || (sentTime + session->timeoutCycles >= now))))
+      continue;
+    // isRetransmit if already sent and timed out (guaranteed by if above)
+    bool isRetransmit = sentTime != 0;
+    // requestAck if retransmit or haven't asked for ack in awhile
+        bool requestAck = isRetransmit ||
+	  (packetsSinceAckReq == REQ_ACK_AFTER - 1);
+        sendOneData(fragNumber, requestAck);
+        sentTimes[fragNumber] = now;
+        if (isRetransmit)
+	  break;
+  }
+
+  // If this is the client end of the connection, must perform additional
+  // work to detect server timeouts.
+  if (useTimer) {
+    // Even if the entire message has been sent, must occasionally
+    // retransmit the last fragment to make sure the server is alive.
+    // This will stop when the first packet of the response is received
+    // (this object will get reset).
+    if ((firstMissingFrag >= totalFrags) && (silentIntervals > 0)) {
+      sendOneData(totalFrags-1, true);
+    }
+
+    // Find the oldest unacknowledged fragment, and schedule the timer
+    // based on that.
+    uint64_t oldestSentTime = now;
+    for (uint32_t fragNumber = firstMissingFrag; fragNumber < stop;
+	 fragNumber++) {
+      uint64_t sentTime = sentTimes[fragNumber];
+      // if we reach a not-sent, the rest must be not-sent
+      if (!sentTime)
+	break;
+      if (sentTime != ACKED && sentTime > 0)
+	if (sentTime < oldestSentTime)
+	  oldestSentTime = sentTime;
+    }
+    timer->start(oldestSentTime + session->timeoutCycles);
+  }
+}
+
+//Send keep alive packet
+void
+FastTransport::OutboundMessage::sendKeepAlive()
+{
+  Header header;
+  session->fillHeader(&header, downCast<uint8_t>(channelId));
+  header.payloadType = Header::KEEP_ALIVE;
+  header.totalFrags=getTotalFrags();
+  Buffer payloadBuffer;
+  Buffer::Iterator iter(&payloadBuffer);
+  transport->sendPacket(session->getAddress(), &header, &iter);
+
 }
 
 /**
@@ -804,11 +956,10 @@ FastTransport::OutboundMessage::send()
 bool
 FastTransport::OutboundMessage::processReceivedAck(Driver::Received* received)
 {
+ 
     silentIntervals = 0;
-    if (!sendBuffer) {
-        LOG(NOTICE, "ack received but no data available to send");
+    if (!sendBuffer)
         return false;
-    }
 
     if (received->len < sizeof(Header) + sizeof(AckResponse)) {
         LOG(WARNING, "ACK packet too short (%d bytes)", received->len);
@@ -829,26 +980,28 @@ FastTransport::OutboundMessage::processReceivedAck(Driver::Received* received)
             "of window %d)", ack->firstMissingFrag,
             firstMissingFrag + sentTimes.getLength());
     } else {
-        LOG(DEBUG, "Received ack on session: 0x%lx, channel: %u,"
-                    "firstMissingFrag: %u, sentTimes window advances for:"
-                    "%u",
-            session->getToken(), channelId, ack->firstMissingFrag,
-            ack->firstMissingFrag - firstMissingFrag);
-
         sentTimes.advance(ack->firstMissingFrag - firstMissingFrag);
-        firstMissingFrag = ack->firstMissingFrag;
-        numAcked = ack->firstMissingFrag;
+	firstMissingFrag = ack->firstMissingFrag;
+	numAcked = ack->firstMissingFrag;
         for (uint32_t i = 0; i < sentTimes.getLength() - 1; i++) {
             bool acked = (ack->stagingVector >> i) & 1;
             if (acked) {
                 sentTimes[firstMissingFrag + i + 1] = ACKED;
-                LOG(DEBUG, "Fragment %u acked after firstMissingFrag(%u)",
-                firstMissingFrag + i + 1, firstMissingFrag);
                 numAcked++;
             }
         }
     }
-    send();
+    
+    nextFragToSend=firstMissingFrag;
+     
+    if (firstMissingFrag != totalFrags) {
+      transport->pfabricObj.addToActiveVector(this);
+      transport->pfabricObj.poll();
+    }
+    else
+      transport->pfabricObj.removeFromActiveVector(this);
+    //    send();
+     
     return firstMissingFrag == totalFrags;
 }
 
@@ -861,6 +1014,7 @@ FastTransport::OutboundMessage::processReceivedAck(Driver::Received* received)
  * \param requestAck
  *      The packet header will have the request ACK bit set.
  */
+
 void
 FastTransport::OutboundMessage::sendOneData(uint32_t fragNumber,
                                             bool requestAck)
@@ -877,14 +1031,10 @@ FastTransport::OutboundMessage::sendOneData(uint32_t fragNumber,
                           dataPerFragment);
     transport->sendPacket(session->getAddress(), &header, &iter);
 
-    if (requestAck) {
-        LOG(DEBUG, "Server asking for an ack for packet fragNumber:"
-                   " %u, session token: 0x%lx "
-                  , fragNumber, session->getToken());
+    if (requestAck)
         packetsSinceAckReq = 0;
-    } else {
+    else
         packetsSinceAckReq++;
-    }
 }
 
 // -- OutboundMessage::Timer ---
@@ -909,15 +1059,28 @@ FastTransport::OutboundMessage::Timer::Timer(OutboundMessage* const outboundMsg)
  */
 void
 FastTransport::OutboundMessage::Timer::handleTimerEvent()
-{
-    outboundMsg->silentIntervals++;
+{   
+   outboundMsg->silentIntervals++;
     if (outboundMsg->silentIntervals > MAX_SILENT_INTERVALS) {
         LOG(WARNING, "timeout waiting for acknowledgment from server at %s",
                 outboundMsg->session->getServiceLocator().c_str());
         outboundMsg->session->abort();
     } else {
-        outboundMsg->send();
+      outboundMsg->nextFragToSend=outboundMsg->firstMissingFrag;
+      outboundMsg->transport->pfabricObj.addToActiveVector(outboundMsg);
+      outboundMsg->transport->pfabricObj.poll();
+       
+      //outboundMsg->send();
     }
+}
+uint32_t
+FastTransport::OutboundMessage::getFirstMissingFrag(){
+  return firstMissingFrag;
+}
+
+uint32_t
+FastTransport::OutboundMessage::getTotalFrags(){
+  return totalFrags;
 }
 
 // -- Session ---
@@ -945,11 +1108,8 @@ FastTransport::ServerSession::ServerSession(FastTransport* transport,
     , clientAddress()
     , clientSessionHint(INVALID_HINT)
 {
-    for (uint32_t i = 0; i < NUM_CHANNELS_PER_SESSION; i++)
-        channels[i].setup(transport, this, i);
-    timeoutCycles = Cycles::fromNanoseconds(1000000) * DEFAULT_TIMEOUT_MS/
-            MAX_SILENT_INTERVALS;
-
+   for (uint32_t i = 0; i < NUM_CHANNELS_PER_SESSION; i++)
+        channels[i].setup(transport, this, i);    
 }
 
 FastTransport::ServerSession::~ServerSession()
@@ -976,7 +1136,7 @@ FastTransport::ServerSession::abort()
  */
 void
 FastTransport::ServerSession::beginSending(uint8_t channelId)
-{
+{  // LOG(NOTICE,"send response for packet number: %d",i);
     ServerChannel* channel = &channels[channelId];
     assert(channel->state == ServerChannel::PROCESSING);
     channel->state = ServerChannel::SENDING_WAITING;
@@ -1018,7 +1178,7 @@ FastTransport::ServerSession::expire(NonIdleAction nonIdleAction)
         channels[i].inboundMsg.reset();
         channels[i].outboundMsg.reset();
     }
-
+ 
     token = INVALID_TOKEN;
     clientSessionHint = INVALID_HINT;
     clientAddress.reset();
@@ -1074,6 +1234,10 @@ FastTransport::ServerSession::processInboundPacket(Driver::Received* received)
             TEST_LOG("processReceivedAck");
             processReceivedAck(channel, received);
             break;
+	    /*	case Header::KEEP_ALIVE:
+	  processReceivedKeepAlive(channel, received);
+	  break;*/
+
         default:
             LOG(WARNING, "current rpcId has bad packet type %d",
                 header->getPayloadType());
@@ -1134,7 +1298,7 @@ FastTransport::ServerSession::sendRequest(Buffer* request, Buffer* response,
 void
 FastTransport::ServerSession::startSession(
                                        const Driver::Address* clientAddress,
-                                       uint32_t clientSessionHint)
+				                             uint32_t clientSessionHint)
 {
     this->clientAddress.reset(clientAddress->clone());
     this->clientSessionHint = clientSessionHint;
@@ -1199,7 +1363,7 @@ void
 FastTransport::ServerSession::processReceivedData(ServerChannel* channel,
                                                   Driver::Received* received)
 {
-    Header* header = received->getOffset<Header>(0);
+  Header* header = received->getOffset<Header>(0);    
     switch (channel->state) {
     case ServerChannel::IDLE:
         LOG(WARNING, "data packet arrived for IDLE channel");
@@ -1231,10 +1395,26 @@ FastTransport::ServerSession::processReceivedData(ServerChannel* channel,
         }
         // Ignore the incoming packet and continue to send the response.
         // Hopefully this will appease the sender spamming us.
-        channel->outboundMsg.send();
+	//       nextFragToSend=firstMissingFrag
+	OutboundMessage *pmsg = &(channel->outboundMsg);
+	pmsg->nextFragToSend=pmsg->getFirstMissingFrag(); 
+	transport->pfabricObj.addToActiveVector(pmsg);
+	transport->pfabricObj.poll();
+		
+        //channel->outboundMsg.send();
         break;
     }
 }
+
+// process a KEEP_ALIVE packet on server side
+/*void
+FastTransport::ServerSession::processReceivedKeepAlive(ServerChannel* channel,
+                                                  Driver::Received* received)
+{
+ 
+  
+}*/
+
 
 // --- ClientSession ---
 
@@ -1426,11 +1606,14 @@ FastTransport::ClientSession::init(const ServiceLocator& serviceLocator,
 {
     serverAddress.reset(transport->driver->newAddress(serviceLocator));
     setServiceLocator(serviceLocator.getOriginalString());
+
     if (timeoutMs == 0)
         timeoutMs = DEFAULT_TIMEOUT_MS;
+    // LOG(NOTICE,"timeoutMs:%" PRIu32,timeoutMs);
     // Careful with the arithmetic below (timeoutMs is only uint32_t).
-    timeoutCycles = Cycles::fromNanoseconds(1000000)*timeoutMs/
-            MAX_SILENT_INTERVALS;
+     timeoutCycles = Cycles::fromNanoseconds(1000000)*timeoutMs/
+       MAX_SILENT_INTERVALS;
+     // LOG(NOTICE,"timeoutCycles:%" PRIu64,timeoutCycles);
 }
 
 /**
@@ -1475,6 +1658,9 @@ FastTransport::ClientSession::processInboundPacket(Driver::Received* received)
         case Header::ACK:
             processReceivedAck(channel, received);
             break;
+	case Header::KEEP_ALIVE:
+          processReceivedKeepAlive(channel, received);
+          break;
         case Header::BAD_SESSION:
             // The server does not believe it has a matching session
             // (perhaps it rebooted?).  Requeue any current RPCs and
@@ -1514,6 +1700,7 @@ void
 FastTransport::ClientSession::sendRequest(Buffer* request, Buffer* response,
                                           RpcNotifier* notifier)
 {
+  
     response->reset();
     ClientRpc* rpc = transport->clientRpcPool.construct(this, request,
                                                         response, notifier);
@@ -1576,6 +1763,7 @@ FastTransport::ClientSession::allocateChannels()
     channels = new ClientChannel[numChannels];
     for (uint32_t i = 0; i < numChannels; i++)
         channels[i].setup(transport, this, i);
+
 }
 
 /**
@@ -1667,6 +1855,33 @@ FastTransport::ClientSession::processReceivedData(ClientChannel* channel,
     }
 }
 
+// process a KEEP_ALIVE packet in client side
+
+void
+FastTransport::ClientSession::processReceivedKeepAlive(ClientChannel* channel,
+                                                  Driver::Received* received)
+{
+  Header* header = received->getOffset<Header>(0);
+  // Discard if idle                                                                                                                         
+  if (channel->state == ClientChannel::IDLE) {
+    LOG(WARNING, "packet arrived on IDLE channel (rpcId %d)",
+	header->rpcId);
+    return;
+  }
+  // If sending end sending and start receiving                                                                                              
+  if (channel->state == ClientChannel::SENDING) {
+    channel->outboundMsg.reset();
+    channel->inboundMsg.init(header->totalFrags,
+    			     channel->currentRpc->response);
+     channel->state = ClientChannel::RECEIVING;
+  }
+  if(channel->state == ClientChannel::RECEIVING) {
+    // InboundMsg has gotten its last fragment                                                                                             
+    channel->inboundMsg.resetSilentIntervals();
+  }
+}
+
+
 /**
  * This method is invoked when a channel becomes free (e.g., when its RPC
  * completes).  It either assigns a new RPC to the channel or marks the
@@ -1755,6 +1970,102 @@ FastTransport::ClientSession::Timer::handleTimerEvent()
             session->getServiceLocator().c_str());
         session->sendSessionOpenRequest();
     }
+}
+
+/*
+ * Pfabric scheduler functionality
+ */
+
+FastTransport::PfabricScheduler::PfabricScheduler(Context* context)
+  : Dispatch::Poller(context->dispatch, "PfabricScheduler")
+  ,activeOutboundMsgs()
+  ,numTokens(0)
+  ,rateLimit(12000)
+  ,maxTokens(5000)
+  ,lastTimeCalled(Cycles::toNanoseconds(Cycles::rdtsc()))
+ {
+ }
+
+void FastTransport::PfabricScheduler::addToActiveVector(OutboundMessage *msg)
+{
+  if (!msg->isActive) {
+    activeOutboundMsgs.push_back(msg);
+    msg->isActive = true;
+  }
+ 
+}
+
+void FastTransport::PfabricScheduler::removeFromActiveVector(OutboundMessage *msg) 
+{
+  if (msg->isActive) {
+    for (size_t i = 0; i < activeOutboundMsgs.size(); i++) {
+      if (activeOutboundMsgs[i] == msg) {
+	size_t last = activeOutboundMsgs.size() - 1;
+	OutboundMessage *temp = activeOutboundMsgs[last];
+	activeOutboundMsgs[i] = temp;
+	activeOutboundMsgs.pop_back();
+      }
+    }
+    msg->isActive = false;
+ 
+  }
+}
+
+size_t
+FastTransport::PfabricScheduler::findMin(std::vector<OutboundMessage*>activeOutboundMsgs){
+  size_t index=0;
+  uint32_t min=activeOutboundMsgs[index]->getTotalFrags();
+  for (size_t i=1; i< activeOutboundMsgs.size(); i++)
+    if (activeOutboundMsgs[i]->getTotalFrags()< min){
+      min=activeOutboundMsgs[i]->getTotalFrags();
+      index=i;
+    }
+  return index;
+  }
+
+
+void FastTransport::PfabricScheduler::poll() 
+{
+   uint64_t now=Cycles::toNanoseconds(Cycles::rdtsc());
+   uint64_t timeElapsed=now-lastTimeCalled;
+   lastTimeCalled=now;
+
+   uint64_t temp=(timeElapsed*(rateLimit/8))/1000;
+   numTokens+=temp;
+   if(numTokens>maxTokens)
+    numTokens=maxTokens;
+  
+   while(!activeOutboundMsgs.empty())
+ { 
+  
+    //finding an  outbound message with the minimum number of frags
+  size_t minIndex=findMin(activeOutboundMsgs);
+  assert(activeOutboundMsgs[minIndex]->isActive == true);
+       
+  activeOutboundMsgs[minIndex]->bytesSent=activeOutboundMsgs[minIndex]->send(numTokens);
+  activeOutboundMsgs[minIndex]->lastTimeSent=Cycles::toNanoseconds(Cycles::rdtsc());
+  numTokens-=activeOutboundMsgs[minIndex]->bytesSent;
+
+  //send keep alive packet for packets that could not send this time and have not sent for more than 50 ms
+  for( size_t i=0; i< activeOutboundMsgs.size();i++){
+    if((Cycles::toNanoseconds(Cycles::rdtsc()))- activeOutboundMsgs[i]->lastTimeSent >= 100000)
+      // send keep alive packet
+      activeOutboundMsgs[i]->sendKeepAlive();
+  }
+	  
+  if(activeOutboundMsgs[minIndex]->nextFragToSend==(activeOutboundMsgs[minIndex]->stopCallSend)+1)
+     removeFromActiveVector(activeOutboundMsgs[minIndex]);
+
+  else 
+    break;
+ }
+  
+}
+
+
+FastTransport::PfabricScheduler::~PfabricScheduler()
+{
+  activeOutboundMsgs.clear();
 }
 
 } // end RAMCloud
