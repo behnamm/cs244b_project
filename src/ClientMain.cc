@@ -1,4 +1,4 @@
-/* Copyright (c) 2009-2014 Stanford University
+/* Copyright (c) 2009-2012 Stanford University
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -14,10 +14,13 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
 #include <string.h>
 #include <getopt.h>
 #include <assert.h>
-
+#include <time.h>
+#include <sys/time.h>
 #include "ClusterMetrics.h"
 #include "Cycles.h"
 #include "ShortMacros.h"
@@ -26,12 +29,18 @@
 #include "OptionParser.h"
 #include "RamCloud.h"
 #include "Tub.h"
+#include <unistd.h>
+#include <algorithm>
+#include <vector>
+#include <fstream>
+#include <iostream>
 
 using namespace RAMCloud;
 
 /*
  * Speed up recovery insertion with the single-shot FillWithTestData RPC.
  */
+uint8_t numSameSizeObj = 1;
 bool fillWithTestData = false;
 
 /**
@@ -154,25 +163,275 @@ exerciseCluster(RamCloud* client)
     expectedLast = last;
 }
 
+class ObjectList
+{
+  public:
+      ObjectList();
+      void append(float probDist, int serverId, int objectSize
+                   , uint64_t tableId, char **keyList, char* tableName
+                   , ObjectList* prev);
+
+  public:
+      float probDist;
+      int serverId;
+      int objectSize;
+      uint64_t tableId;
+      char** keyList;
+      uint16_t objReadMap;
+      char* tableName;
+      ObjectList *next;
+};
+
+
+ObjectList::ObjectList(): probDist(0) 
+                        , serverId(0)
+                        , objectSize(0)
+                        , tableId(0)
+                        , keyList(NULL)
+                        , objReadMap(0)
+                        , tableName(NULL)
+                        , next(NULL)
+{
+}
+
+void
+ObjectList::append(float probDist, int serverId, int objectSize
+                    , uint64_t tableId, char **keyList, char* tableName
+                    , ObjectList* prev)
+{
+    this->probDist = probDist;
+    this->serverId = serverId;
+    this->objectSize = objectSize;
+    this->tableId = tableId;
+    this->keyList = new char*[numSameSizeObj];
+    for (int i = 0; i < numSameSizeObj; i++) {
+        this->keyList[i] = new char[strlen(keyList[i]) + 1];
+        strcpy(this->keyList[i] ,keyList[i]);
+    }
+    this->objReadMap = 0;
+    this->tableName = new char[strlen(tableName) + 1];
+    strcpy(this->tableName, tableName);
+    this->next = NULL;
+    prev->next = this;
+}
+
+void freeObjectList(ObjectList* objToFree)
+{
+    if (objToFree->next) {
+        freeObjectList(objToFree->next);
+    }
+    for (int i = 0; i < numSameSizeObj; i++){
+        delete[] objToFree->keyList[i];
+    }
+    delete[] objToFree->keyList; 
+    delete objToFree->tableName;
+    delete objToFree;
+}
+
+void printObj(ObjectList* objToPrint){
+    LOG(NOTICE, "\n**********Object Fields**********:\n Distribution: %f\
+, Object Size: %d , Table ID: %lu, Table Name: %s, Server ID: %d\
+, Object Key: %s", objToPrint->probDist, objToPrint->objectSize
+, objToPrint->tableId, objToPrint->tableName, objToPrint->serverId
+, objToPrint->keyList[0]);
+}
+
+void 
+initRandomSeed(){
+    static bool initialized = false;
+    if( !initialized ){
+        srand ( int ( time( NULL ) ) );
+        initialized = true;
+    }
+}
+
+double 
+randomReal( double low, double high) {
+    initRandomSeed();
+    double d = rand() / (double(RAND_MAX) + 1);
+    return low + d * ( double(high)  - low );
+}
+
+int 
+randomInteger( int low, int high){
+    initRandomSeed();
+    double d = rand() / (double (RAND_MAX) + 1);
+    return int(low + floor( d * (double(high) - low + 1)));
+}
+        
+
+//open file, read the number of servers and objects, create a link list of 
+//objects
+int readFile(std::vector<float> &probVector, std::vector<int> &objSizeVec) 
+{
+    string lineString;
+    string word;
+    int objectSize = 0;
+    float probDist = 0;
+    int wordCount = 0;
+    int lineCounter = 0;
+    float prob = 0;
+    int serversTotal = 0;
+    std::ifstream inFile("/home/alizade/ramcloud/Distribution.txt");
+    if (inFile.is_open()) {
+        while (!inFile.eof()) {
+            getline(inFile, lineString, '\n');
+            lineCounter++;
+            std::stringstream lineStream(lineString);
+            //LOG(NOTICE,"%s",line);
+            //the numebr of servers is in the first line of file
+            if (lineCounter == 1) {
+                serversTotal = std::stoi(lineString);
+            } else {	  
+                while (lineStream >> word) {
+                    if (wordCount == 0 ) {
+                        prob = stof(word);
+                        wordCount = 1;
+                        //filling the probabilities vector, 
+                        //using in traffic generator 
+                        probDist = probDist + prob;
+                        probVector.push_back(probDist);
+                              
+                    } else {
+                        objectSize = stoi(word);
+                        objSizeVec.push_back(objectSize);
+                        wordCount = 0;
+                    }
+
+                }
+            }
+        }
+        inFile.close();
+        return serversTotal;
+    } else {
+        LOG(NOTICE,"Unable to open the file");
+        return 0;
+    }
+}
+
+
+ObjectList*
+createObjects(RamCloud &client, std::vector<int> objSizeVec
+              , std::vector<float> probVector, int serverNum)
+{
+    //Creating Tables
+    char tableName[100];
+    uint64_t table;
+    int serverId;
+    std::vector<std::string> tableNameVec;
+    tableNameVec.clear();
+    std::vector<uint64_t> tableIdVec;
+    tableIdVec.clear();
+    int objectSize;
+    for ( int j = 0; j < int(objSizeVec.size()); j++) {
+        objectSize = objSizeVec.at(j);
+        for (int i = 1; i <= serverNum; i++) {
+            sprintf(tableName
+                    , "table_ObjSize%dServer%d"
+                    , objectSize, i);
+            client.createTable(tableName);
+            table = client.getTableId(tableName);
+            tableNameVec.push_back(std::string(tableName));
+            tableIdVec.push_back(table);
+            LOG(NOTICE,"created table %s with id %lu"
+               , tableNameVec.at(serverNum*j+i-1).c_str(), table);
+        }
+    }
+    
+    ObjectList* head = new ObjectList;
+    ObjectList *objPrev = head;
+    ObjectList* objCurr = NULL;
+    char **objKeyList = new char*[numSameSizeObj];
+    for (int i = 0; i < numSameSizeObj; i++)
+        objKeyList[i] = new char[100]; 
+    int writtenObjects = 0;
+    for (int i = 0; i < serverNum; i++) {
+        serverId = i + 1;
+        for (int j = 0; j < int(objSizeVec.size()); j++) {
+            objectSize = objSizeVec.at(j);
+            char val[objectSize];
+            memset(val, 0xcc, objectSize);
+            for (int k = 0; k < numSameSizeObj; k++) {
+                sprintf(objKeyList[k]
+                        , "key%d_objSize%dServer%d", k+1, objectSize, i+1);
+                LOG(NOTICE,"keyList: %s",objKeyList[k]);
+                client.write(tableIdVec.at(i + serverNum * j), objKeyList[k]
+                             , downCast<uint16_t>(strlen(objKeyList[k]))
+                             , val
+                             , downCast<uint32_t>(strlen(val) + 1));
+                writtenObjects++;
+            }
+            objCurr = new ObjectList;
+            objCurr->append(probVector.at(j)
+                             , serverId, objectSize
+                             , tableIdVec.at(i + serverNum * j)
+                             , objKeyList
+                             , const_cast<char*>
+                                    (tableNameVec.at(i + serverNum * j).c_str())
+                             , objPrev);
+            objPrev = objCurr;
+        }
+    }
+
+    ObjectList* temp = head;
+    head = head->next;
+    delete temp;
+    
+    for (int i = 0; i < numSameSizeObj; i++){
+        delete[] objKeyList[i];
+    }
+    delete[] objKeyList;
+
+    objCurr = head;
+    while (objCurr){
+        printObj(objCurr);
+        objCurr = objCurr->next;
+    }  
+
+    LOG(NOTICE,"\n-----------write complete for total of %d objects----------"
+              , writtenObjects);
+    return head;
+}
+
+class RpcList
+{
+  public:
+    RpcList();
+  public:
+    int objectSize;
+    int serverId;
+    uint64_t start;
+    Buffer *buffer;
+    ReadRpc *rpc; 
+    RpcList *next;
+};
+
+RpcList::RpcList(): objectSize(0) 
+                  , serverId(0)
+                  , start(0)
+                  , buffer(NULL)
+                  , rpc(NULL)
+                  , next(NULL)
+{
+}
+
 int
 main(int argc, char *argv[])
 try
 {
+
+    int activeRpcCap;
     int count, removeCount;
     uint32_t objectDataSize;
     uint32_t tableCount;
     uint32_t skipCount;
-    uint64_t b;
     int clientIndex;
     int numClients;
     bool exercise;
-
-    // Set line buffering for stdout so that printf's and log messages
-    // interleave properly.
-    setvbuf(stdout, NULL, _IOLBF, 1024);
-
+    uint64_t thruput;
+    
     // need external context to set log levels with OptionParser
-    Context context(false);
+    Context context(true);
 
     OptionsDescription clientOptions("Client");
     clientOptions.add_options()
@@ -211,10 +470,18 @@ try
          ProgramOptions::value<uint32_t>(&objectDataSize)->
             default_value(1024),
          "Number of bytes to insert per object during insert phase.")
+        ("throughput,p",
+         ProgramOptions::value<uint64_t>(&thruput)->default_value(10000000000),
+         "Client network bandwdith")
         ("exercise",
          ProgramOptions::bool_switch(&exercise),
          "Call exerciseCluster repeatedly (intended for coordinator "
-         "crash testing).");
+         "crash testing).")
+        ("rpccap,c",
+         ProgramOptions::value<int>(&activeRpcCap)->default_value(25),
+         "Maximum number of outstanding RPC's at a time");
+
+
 
     OptionParser optionParser(clientOptions, argc, argv);
     context.transportManager->setSessionTimeout(
@@ -236,86 +503,134 @@ try
             usleep(2000000);
         }
     }
-
-    b = Cycles::rdtsc();
-    client.createTable("test");
-    uint64_t table;
-    table = client.getTableId("test");
-    LOG(NOTICE, "create+open table took %lu ticks", Cycles::rdtsc() - b);
-
-    b = Cycles::rdtsc();
-    client.write(table, "42", 2, "Hello, World!", 14);
-    LOG(NOTICE, "write took %lu ticks", Cycles::rdtsc() - b);
-
-    b = Cycles::rdtsc();
-    const char *value = "0123456789012345678901234567890"
-        "123456789012345678901234567890123456789";
-    client.write(table, "43", 2, value, downCast<uint32_t>(strlen(value) + 1));
-    LOG(NOTICE, "write took %lu ticks", Cycles::rdtsc() - b);
-
-    Buffer buffer;
-    b = Cycles::rdtsc();
-    uint32_t length;
-
-    client.read(table, "43", 2, &buffer);
-    LOG(NOTICE, "read took %lu ticks", Cycles::rdtsc() - b);
-
-    length = buffer.size();
-    LOG(NOTICE, "Got back [%s] len %u",
-        static_cast<const char*>(buffer.getRange(0, length)),
-        length);
-
-    client.read(table, "42", 2, &buffer);
-    LOG(NOTICE, "read took %lu ticks", Cycles::rdtsc() - b);
-    length = buffer.size();
-    LOG(NOTICE, "Got back [%s] len %u",
-        static_cast<const char*>(buffer.getRange(0, length)),
-        length);
-
-    char val[objectDataSize];
-    memset(val, 0xcc, objectDataSize);
-
-    LOG(NOTICE, "Performing %u writes of %u byte objects",
-        count, objectDataSize);
-    string keys[count];
-    for (int j = 0; j < count; j++)
-        keys[j] = format("%d", j);
-    b = Cycles::rdtsc();
-    for (int j = 0; j < count; j++)
-        client.write(table, keys[j].c_str(),
-                     downCast<uint16_t>(keys[j].length()),
-                     val, downCast<uint32_t>(strlen(val) + 1));
-    uint64_t bb =  Cycles::rdtsc();
-    LOG(NOTICE, "%d writes took %lu ticks", count, bb - b);
-    LOG(NOTICE, "avg write took %lu ticks, %lu nano seconds"
-        , (bb - b) / count
-        , Cycles::toNanoseconds((bb - b) / count));
-    LOG(NOTICE, "Reading one of the objects just inserted");
-    b = Cycles::rdtsc();
-    client.read(table, "0", 1, &buffer);
-    bb =  Cycles::rdtsc();
-    LOG(NOTICE, "read took %lu ticks, %lu nano seconds"
-        , bb - b
-        , Cycles::toNanoseconds(bb - b));
-    LOG(NOTICE, "Reading all of the objects just inserted.");
-    b = Cycles::rdtsc();
-    for (int j = 0; j < count; j++)
-         client.read(table, keys[j].c_str(),
-                     downCast<uint16_t>(keys[j].length()),
-                     &buffer);
-    bb =  Cycles::rdtsc();
-    LOG(NOTICE, "avg read took %lu ticks, %lu nano seconds"
-        , (bb - b) / count
-        , Cycles::toNanoseconds((bb - b) / count));
-
-    LOG(NOTICE, "Performing %u removals of objects just inserted", removeCount);
-    for (int j = 0; j < count && j < removeCount; j++) {
-        string key = format("%d", j);
-        client.remove(table, key.c_str(), downCast<uint16_t>(key.length()));
+    
+    std::vector<float> probVector;
+    probVector.clear();
+    std::vector<int> objSizeVec;
+    objSizeVec.clear();
+    int serversTotal = readFile(probVector, objSizeVec);
+    if (probVector.size() != objSizeVec.size()){
+        
+        LOG(NOTICE, "error in reading file, totoal objects read:%zu,\
+total probs read:%zu", probVector.size(), objSizeVec.size());
+        return 0;
     }
 
-    client.dropTable("test");
+    ObjectList* head = createObjects(client, objSizeVec
+                                     , probVector, serversTotal);
+    // a simple read of the objects to make sure all abjects can 
+    // be read
+    Buffer buf;
+    for (int i = 0; i < 10; i++) {
+        ObjectList* objCurr = head;
+        while (objCurr) {
+            uint64_t st = Cycles::rdtsc();
+            client.read(objCurr->tableId, objCurr->keyList[0]
+                        , downCast<uint16_t>(strlen(objCurr->keyList[0]))
+                        , &buf);
+            uint64_t sp = Cycles::rdtsc();
+            LOG(NOTICE,"read took %lu nanoseconds for object %d on server %d"
+                , Cycles::toNanoseconds(sp - st)
+                , objCurr->objectSize, objCurr->serverId);
+            objCurr = objCurr->next;
 
+        }
+    }
+    LOG(NOTICE, "******************************************End of the usual \
+reads*************************************");
+
+    vector<uint64_t> latency(size_t(count), 0);
+    vector<int> objectSizes(size_t(count), 0);
+    vector<int> serverIds(size_t(count),0);
+    uint64_t stop = 0;
+    int rpcCount = 0;
+    int activeRpcNum = 0;
+    RpcList* headRpc = NULL;
+    int ind = 0;
+    while (true) {
+        if (activeRpcNum <= activeRpcCap && rpcCount < count) {
+            //find a random object in a random server 
+            ObjectList* objCurr = head;
+            double r = randomReal(0, 1);
+            int serverNum = randomInteger(1, serversTotal);
+            while (objCurr) {
+                if( (objCurr->serverId == serverNum) 
+                    && (objCurr->probDist >= r) ) {
+
+                    LOG(DEBUG, 
+                        "found the server to read object from. \
+    ServerId is: %d, ObjectSize is: %d"
+                        , objCurr->serverId, objCurr->objectSize);
+
+                    break;
+                }
+                objCurr = objCurr->next;
+            }
+
+            //add a new rpc to the list
+            RpcList* currRpc = new RpcList;
+            currRpc->next = headRpc;
+            headRpc = currRpc;
+            currRpc->start = Cycles::rdtsc();
+            currRpc->objectSize = objCurr->objectSize;
+            currRpc->serverId = objCurr->serverId;
+            currRpc->buffer = new Buffer;
+            currRpc->rpc = new ReadRpc(
+                                 &client, objCurr->tableId, objCurr->keyList[0]
+                               , downCast<uint16_t>(strlen(objCurr->keyList[0]))
+                               , currRpc->buffer);
+
+            LOG(DEBUG,"memory address of the rpc:%p",currRpc->rpc);
+            activeRpcNum++;
+            rpcCount++;
+        }
+        for (int rr = 0; rr < 2; rr++) {
+            client.clientContext->dispatch->poll();
+        }
+        //check on the list of rpc. If any of them is finished, remove it from 
+        //the list and add measure the latency for it.
+        RpcList* currRpc = headRpc;
+        RpcList* prevRpc = NULL; 
+        while (currRpc) {
+            if (currRpc->rpc->isReady()) {
+                stop = Cycles::rdtsc();
+                latency.at(ind) = Cycles::toNanoseconds(stop 
+                                                          - currRpc->start);
+                serverIds.at(ind) = currRpc->serverId;
+                objectSizes.at(ind++) = currRpc->objectSize;
+                currRpc->buffer->reset();
+                delete currRpc->buffer;
+                delete currRpc->rpc;
+                RpcList *toBeDeleted = currRpc;
+
+                activeRpcNum--;
+                if (currRpc == headRpc)
+                    headRpc = headRpc->next;
+                currRpc = currRpc->next;
+                if (prevRpc)
+                    prevRpc->next = currRpc;
+
+                delete toBeDeleted;
+            } else {
+                prevRpc = currRpc;
+                currRpc = currRpc->next;
+            }
+        }
+
+        LOG(DEBUG,"number of total rpc sent: %d and number of active rpc: %d"
+            , rpcCount, activeRpcNum);
+        
+        if ((activeRpcNum == 0) && (rpcCount ==  count))
+            break;
+    }
+    std::ofstream outFile;
+    outFile.open("/home/alizade/ramcloud/latency.txt");
+    for(size_t j = 0; j < latency.size(); j++)
+        outFile << std::fixed << std::setprecision(12) << latency[j] << ",\t" 
+                << objectSizes[j] << ",\t" << serverIds[j] <<"\n";
+    outFile.close();
+
+    freeObjectList(head); 
     return 0;
 } catch (RAMCloud::ClientException& e) {
     fprintf(stderr, "RAMCloud exception: %s\n", e.str().c_str());
